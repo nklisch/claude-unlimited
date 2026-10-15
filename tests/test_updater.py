@@ -357,8 +357,8 @@ def test_install_prefers_a_real_venv_over_the_user_site(tmp_path, monkeypatch):
 def test_update_source_is_hardcoded_not_configurable():
     """A compromised config file must not be able to point the updater at a
     different repository."""
-    assert updater.CLONE_URL == "https://github.com/DevDock-AI/claude-unlimited.git"
-    assert updater.RELEASES_LATEST_URL.startswith("https://api.github.com/repos/DevDock-AI/claude-unlimited/")
+    assert updater.CLONE_URL == "https://github.com/nklisch/claude-unlimited.git"
+    assert updater.RELEASES_LATEST_URL.startswith("https://api.github.com/repos/nklisch/claude-unlimited/")
     source = Path(updater.__file__).read_text()
     assert "load_pool" not in source and "update_settings" not in source
 

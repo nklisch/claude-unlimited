@@ -15,3 +15,12 @@ paused after 30 idle minutes), send no messages, are limited to one per account 
 minutes, back off hard and persistently on 429/401/403, and can be turned off in Settings.
 Keep-warm traffic — requests sent to start or game a quota window — remains excluded.
 
+## Fork amendment — five-minute usage polling
+
+Enabled subscription accounts use the existing read-only poller about once
+every five minutes, including while idle and during ongoing inference
+traffic. This supersedes the idle and passive-traffic skips above.
+Actual endpoint read times are persisted separately from response-header
+observations, so a restart preserves the cadence. Provider and per-account
+backoff still apply, and the existing Settings switch can disable polling.
+No inference messages are sent to measure usage or keep accounts warm.

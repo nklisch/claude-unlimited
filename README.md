@@ -2,6 +2,21 @@
 
 # Claude Unlimited
 
+Personal fork of [DevDock-AI/claude-unlimited](https://github.com/DevDock-AI/claude-unlimited).
+Install or update this fork on Linux or macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nklisch/claude-unlimited/main/install.sh | bash
+```
+
+This fork carries the weekly quota fixes, independent account thresholds,
+five-minute usage polling, reset-time display, 128 MiB requests, 15-minute
+upstream socket timeouts, retries before account rotation, streaming fixes,
+diagnostic logging, and a Linux service that restarts after exits. On Linux,
+credentials are stored as plaintext files with owner-only permissions, with
+the keyring as a best-effort mirror. See [fork installation and maintenance](docs/FORK.md)
+for details, updates, and moving accounts to another machine.
+
 ### When one account hits its usage limit, your session doesn't.
 
 Claude Unlimited pools your Claude (Pro · Max), ChatGPT/Codex, and Anthropic API accounts
@@ -27,7 +42,7 @@ the session — the account underneath you changes and nothing else does. Often 
 dashboard's activity log is the only place you'll find out it happened.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![CI](https://github.com/DevDock-AI/claude-unlimited/actions/workflows/ci.yml/badge.svg)](https://github.com/DevDock-AI/claude-unlimited/actions/workflows/ci.yml)
+[![CI](https://github.com/nklisch/claude-unlimited/actions/workflows/ci.yml/badge.svg)](https://github.com/nklisch/claude-unlimited/actions/workflows/ci.yml)
 ![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey)
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Backend dependencies](https://img.shields.io/badge/backend%20dependencies-1-brightgreen)
@@ -109,7 +124,7 @@ Anthropic API keys, your own gateway — and treats them as one continuous suppl
 | 🔒 | **100% local** — no account, no telemetry, no cloud. Your credentials never leave your machine. |
 | ⚙️ | **One command to work** — `claude-unlimited code` and you're routed. |
 | 🔔 | **Notifications** — told before you run out, not after. |
-| 🔑 | **OS-native credential storage** — Keychain / Secret Service / DPAPI. Never plaintext on disk. |
+| 🔑 | **Local credential storage** — Linux uses owner-only plaintext files with a keyring mirror; macOS uses Keychain and Windows uses DPAPI. |
 | 📦 | **Encrypted export/import** — move your whole setup to another machine safely. |
 | 🌍 | **4 languages** — English, Spanish, Romanian, German. |
 | 🪶 | **Almost no dependencies** — Python standard library, one library for export encryption, zero frontend build. |
@@ -164,44 +179,45 @@ This is the part worth being explicit about:
 - **No telemetry, ever.** Usage stats, cost estimates, the activity log, project
   attribution — all of it is written to files in your home directory and read by a
   dashboard served from `127.0.0.1`. None of it is transmitted anywhere.
-- **Your credentials never move.** They live in your OS keystore (macOS Keychain, Linux
-  Secret Service, Windows DPAPI), never in plaintext on disk, and are attached to a
+- **Your credentials stay local.** Linux stores them in owner-only plaintext files
+  under `~/.claude-unlimited/secrets/`, with a best-effort Secret Service mirror.
+  macOS uses Keychain and Windows uses DPAPI. Credentials are attached to a
   request only at the moment it goes to **the provider you configured** — Anthropic,
   OpenAI, or your own gateway.
 - **`claude` never sees your real credentials either.** It authenticates to the daemon
   with a local placeholder token. The real credential is substituted server-side and never
   returned to the client.
-- **Almost the only outbound traffic is the API call you already intended to make** —
-  same destination as without this tool. No quota probing, no keep-warm pings, no
-  background chatter. The two exceptions are both ones you can name: a once-a-day
-  version check against GitHub's public API, and refreshing an account's own OAuth
-  token shortly before it expires, so an account you haven't used in a while doesn't
-  quietly need a re-login.
+- **Background reads are limited to named purposes:** enabled subscription accounts'
+  read-only usage endpoints about every five minutes (with provider backoff), a daily
+  version check against this fork's GitHub Releases API, and OAuth token refreshes.
+  Usage polling can be disabled in Settings. No inference messages are sent to
+  measure usage or keep accounts warm.
 
 ---
 
 ## Install
 
-Pick your system, copy the **one line**, paste, done. It installs everything it needs
-(even Python, if you don't have it), starts in the background, and opens the dashboard at
+Pick your system and run the install command. Linux and macOS require Python 3.10+,
+git, and the `claude` CLI first; the Windows installer can install Python. It
+starts in the background and opens the dashboard at
 **http://127.0.0.1:4317/** — where you add your first account.
 
 **🍎 macOS & 🐧 Linux** — paste into a terminal:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/nklisch/claude-unlimited/main/install.sh | bash
 ```
 
 **🪟 Windows** — press **Win + R** (or open **Command Prompt**), paste, press Enter:
 
 ```bat
-powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.ps1 | iex"
+powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/nklisch/claude-unlimited/main/install.ps1 | iex"
 ```
 
 **🪟 Windows, already in PowerShell?** — paste this shorter version instead:
 
 ```powershell
-irm https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/nklisch/claude-unlimited/main/install.ps1 | iex
 ```
 
 Then run `claude-unlimited code` and you're routed. On Windows, run the installer from an
@@ -213,7 +229,7 @@ credentials are stored with Windows DPAPI instead of the Keychain.
 > every OS-specific piece (credential storage, the background service, the installer) is
 > implemented and covered by tests, and it *should* work fine — but it hasn't had the same
 > real-world mileage, so treat it as "should be fine, not guaranteed." If anything's off,
-> please [open an issue](https://github.com/DevDock-AI/claude-unlimited/issues).
+> please [open an issue](https://github.com/nklisch/claude-unlimited/issues).
 
 Don't want it starting on login? Turn it off in **Settings → Daemon**, or run
 `claude-unlimited uninstall`. It keeps running either way until you stop it.
@@ -238,7 +254,7 @@ says so rather than pretending it succeeded.
 Prefer to read it first, or install from a checkout?
 
 ```bash
-git clone https://github.com/DevDock-AI/claude-unlimited.git
+git clone https://github.com/nklisch/claude-unlimited.git
 cd claude-unlimited
 ./install.sh
 ```
@@ -400,14 +416,28 @@ The dashboard URL stays in Claude Code's status line while you work.
 ### What rotation actually does
 
 1. Requests go to the enabled account with the **lowest priority number**.
-2. It stays on that account — *sticky* — until it crosses its **switch threshold**
-   (default 98%) or hits a real quota limit.
+2. It stays on that account — *sticky* — until either its **5-hour switch threshold**
+   or its **weekly switch threshold** is reached (default 98% each), or it hits a real quota limit.
 3. The next account takes over **on the next request**. Your session continues
    uninterrupted; nothing is lost and nothing is restarted.
 4. When a quota window resets, that account rejoins the rotation automatically.
 
-A brief rate-limit blip never causes a switch — only a real threshold crossing or genuine
-exhaustion does.
+Open an account's details in **Profiles** to set the two percentages independently.
+For example, keep the 5-hour threshold at 98% and set the weekly threshold to 75%
+to reserve the rest of that account's weekly allowance. These limits use the
+account's total reported usage, shared by all sessions. Crossing either stops
+automatic routing to that account; resetting the 5-hour window does not reopen
+it while the weekly threshold is still reached. Explicit account pins and Take
+over retain their existing override behavior.
+
+The saved fields are `switch_threshold` (primary window) and
+`weekly_switch_threshold` (weekly window). Older config files and exports that
+omit the weekly field inherit their existing `switch_threshold`, preserving
+the previous behavior; subsequent saves keep the two values separately.
+
+Transient failures are retried on the same account first. If those attempts
+are exhausted, the router may fall back to another account; threshold
+crossings and confirmed quota exhaustion can also trigger rotation.
 
 **Coming back.** Once it has switched, the pool stays on the new account for as long as that
 account works — even after your first-choice one refills. That is on purpose: moving back
@@ -420,15 +450,15 @@ wins over it, and a pinned branch keeps its own account until that account stops
 ### Keeping usage numbers fresh
 
 Usage normally arrives with real responses, so an account nobody has used lately would show
-a stale number or *not yet observed*. While you're active — sending requests through Claude
-Unlimited or using the dashboard — each Claude and ChatGPT-subscription account's usage is
-read every **5–10 minutes** from the provider's own read-only usage endpoint (the one Claude
-Code's `/usage` and the Codex CLI read). No messages are sent.
+a stale number or *not yet observed*. Each enabled Claude and ChatGPT-subscription account's
+usage is read about **every 5 minutes** from the provider's own read-only usage endpoint
+(the one Claude Code's `/usage` and the Codex CLI read). Reads continue while idle and during
+active sessions. No messages are sent.
 
-- **Pauses after 30 minutes idle**, and resumes the moment you're back.
-- **Skips an account that real traffic just refreshed.**
-- **Backs off hard.** A rate limit waits at least 15 minutes (or the provider's
-  `Retry-After`), doubling up to 6 hours, and pauses that whole provider. A refused
+- **Staggers accounts**, reading at most two per 30-second tick. Real traffic does not
+  postpone the next usage read, and successful poll times survive restarts.
+- **Backs off hard.** A rate limit waits at least 15 minutes, doubling up to 6 hours
+  or longer if the provider's `Retry-After` requests it, and pauses that whole provider. A refused
   credential waits hours and never marks the account broken. Backoff survives restarts.
 - API-key profiles are skipped — they have no subscription windows to read.
 - **Per-model limits.** A Claude account can have a weekly limit for one model on top of its
@@ -930,6 +960,10 @@ notification** there to confirm they reach you.
 
 ## Updates
 
+This fork checks its own published releases. To update from the fork's
+`main` branch, re-run the [install command](#install); it preserves account
+data and restarts the proxy. No fork releases have been published yet.
+
 Claude Unlimited checks for new releases on its own and does exactly what you
 tell it to in **Settings → Updates**:
 
@@ -1120,7 +1154,7 @@ was skipped.
 
 | What | Where |
 |---|---|
-| Credentials | macOS Keychain / Linux Secret Service / Windows DPAPI — never plaintext on disk |
+| Credentials | Linux: `~/.claude-unlimited/secrets/` (plaintext, directory 0700/files 0600), with best-effort Secret Service mirror. macOS: Keychain. Windows: DPAPI. |
 | Account configuration | `~/.claude-unlimited/config.json` |
 | Usage history, activity log, project attribution | `~/.claude-unlimited/claude_unlimited.db` — one local SQLite file, kept in full (older `*.jsonl` logs are imported once on first start and renamed `*.imported`) |
 | Logs | `~/.claude-unlimited/logs/` |
@@ -1150,10 +1184,10 @@ Claude Unlimited automates something you could do by hand: switching to another 
 own accounts when one runs low. It uses only credentials you configure, runs entirely on
 your machine, and is fully open source.
 
-Anthropic hasn't explicitly endorsed automated multi-account rotation. This project
-deliberately avoids what would make that worse — no quota probing, no keep-warm traffic,
-nothing that acts without a real request from you. Use your own judgment about your own
-accounts' terms.
+Anthropic hasn't explicitly endorsed automated multi-account rotation. This fork
+reads subscription usage endpoints periodically and refreshes OAuth tokens in the
+background; it sends no inference messages to measure usage or keep accounts warm.
+Use your own judgment about your own accounts' terms.
 
 ## Development
 

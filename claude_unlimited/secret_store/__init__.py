@@ -22,7 +22,7 @@ if _SYSTEM == "Darwin":
 elif _SYSTEM == "Linux":
     # UNVERIFIED — see linux_secretservice.py's module docstring.
     from .linux_secretservice import delete_token, get_token, has_token, set_token
-    BACKEND_NAME = "Linux Secret Service (libsecret)"
+    BACKEND_NAME = "Linux credential files (disk-first, Secret Service mirror)"
 elif _SYSTEM == "Windows":
     # UNVERIFIED — see windows_dpapi.py's module docstring.
     from .windows_dpapi import delete_token, get_token, has_token, set_token

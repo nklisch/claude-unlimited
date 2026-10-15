@@ -1,5 +1,5 @@
-"""Keeps each account's usage numbers fresh while someone is actually using
-Claude Unlimited.
+"""Keeps enabled subscription accounts' usage numbers fresh, including idle
+accounts and accounts serving continuous traffic.
 
 Usage percentages normally arrive passively, in the rate-limit headers of real
 responses, so an account nobody has routed to lately shows a stale number or
@@ -10,14 +10,12 @@ windows without sending a message.
 It is automated traffic against third-party APIs on the user's own
 credentials, so it is deliberately gentle (ADR 0001, amended 2026-09-15):
 
-  * Only while the user is present. Any proxied request or Dashboard
-    interaction counts; after IDLE_AFTER_SECONDS of neither, nothing is sent
-    until activity resumes.
-  * At most one read per account every 5-10 minutes, jittered so accounts
-    never fire in lockstep, and none for an account that real traffic already
-    refreshed inside that window.
+  * Read each account about every five minutes, even while idle. Endpoint
+    poll times are separate from passive response observations, so continuous
+    traffic cannot postpone a read. At most two accounts are read per tick.
   * Hard, escalating, persisted backoff. A 429 honours Retry-After, waits at
-    least 15 minutes, doubles up to 6 hours, and pauses that whole provider. A
+    least 15 minutes, doubles up to 6 hours (longer if requested by the
+    provider), and pauses that whole provider. A
     401/403 (for example a token without the usage scope) waits hours and never
     marks the account itself broken — only a real request does that. Anything
     else backs off from 5 minutes to an hour. The state survives restarts, so
@@ -30,14 +28,15 @@ and `_urlopen` is the single network seam, which the test suite replaces.
 
 from __future__ import annotations
 
-import hashlib
 import json
+import math
 import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -54,8 +53,6 @@ PROVIDER_ANTHROPIC = "anthropic"
 PROVIDER_OPENAI = "openai"
 
 BASE_INTERVAL_SECONDS = 300.0
-JITTER_SECONDS = 300.0              # so each account is read every 5-10 minutes
-IDLE_AFTER_SECONDS = 1800.0
 MAX_PROBES_PER_TICK = 2             # spreads a burst of due accounts over ticks
 TICK_SECONDS = 30.0
 REQUEST_TIMEOUT_SECONDS = 10.0
@@ -101,7 +98,6 @@ class ProbeResult:
 class Candidate:
     profile_id: str
     provider: str
-    observed_at: Optional[float]    # epoch seconds of the last usage reading, any source
 
 
 # ---- HTTP -------------------------------------------------------------------
@@ -109,15 +105,34 @@ class Candidate:
 def _number(value) -> Optional[float]:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _percentage(value) -> Optional[float]:
+    number = _number(value)
+    # An over-limit reading still means spent; do not discard the account's
+    # other usage windows just because the provider reports an overshoot.
+    return number if number is not None and number >= 0 else None
 
 
 def _parse_retry_after(value) -> Optional[float]:
     try:
         seconds = float(value)
     except (TypeError, ValueError):
-        return None
-    return seconds if seconds > 0 else None
+        if not isinstance(value, str):
+            return None
+        try:
+            retry_at = parsedate_to_datetime(value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            seconds = retry_at.timestamp() - time.time()
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+    return seconds if math.isfinite(seconds) and seconds > 0 else None
 
 
 def _get(url: str, headers: dict) -> tuple[Optional[int], Optional[float], Optional[object]]:
@@ -140,6 +155,7 @@ def fetch_anthropic_usage(access_token: str) -> ProbeResult:
     status, retry_after, body = _get(ANTHROPIC_USAGE_URL, {
         "Authorization": f"Bearer {access_token}",
         "anthropic-beta": ANTHROPIC_OAUTH_BETA,
+        "anthropic-version": "2023-06-01",
         "User-Agent": CLAUDE_CODE_USER_AGENT,
         "Accept": "application/json",
     })
@@ -174,25 +190,31 @@ def anthropic_usage_headers(body) -> Optional[dict]:
     observation.classify() already understands, so a reading here lands in
     exactly the pipeline a real response does. The endpoint reports
     utilization as a percentage (46.0 means 46%); the headers carry 0-1.
-    None when the 5-hour window is missing — there is nothing to show."""
+    Current limits[] account rows take precedence over legacy window fields.
+    None when the 5-hour account window is unreadable: the existing classifier
+    needs it to accept a snapshot, so never invent zero usage for it."""
     if not isinstance(body, dict):
         return None
     headers: dict = {}
+    entries = {}
     for window, prefix in (("five_hour", "5h"), ("seven_day", "7d")):
         entry = body.get(window)
-        if not isinstance(entry, dict):
-            continue
-        utilization = _number(entry.get("utilization"))
-        if utilization is None:
-            continue
+        if isinstance(entry, dict) and _percentage(entry.get("utilization")) is not None:
+            entries[prefix] = (entry["utilization"], entry.get("resets_at"))
+    if isinstance(body.get("limits"), list):
+        for row in body["limits"]:
+            if not isinstance(row, dict):
+                continue
+            kind = row.get("kind")
+            prefix = "5h" if kind == "session" else "7d" if kind == "weekly_all" else None
+            utilization = _percentage(row.get("percent"))
+            if prefix is not None and utilization is not None:
+                entries[prefix] = (utilization, row.get("resets_at"))
+    for prefix, (utilization, resets_at) in entries.items():
         headers[f"anthropic-ratelimit-unified-{prefix}-utilization"] = str(utilization / 100)
-        resets_at = entry.get("resets_at")
-        if isinstance(resets_at, str):
-            try:
-                headers[f"anthropic-ratelimit-unified-{prefix}-reset"] = str(
-                    int(datetime.fromisoformat(resets_at.replace("Z", "+00:00")).timestamp()))
-            except ValueError:
-                pass
+        reset = _epoch_or_iso(resets_at) if isinstance(resets_at, str) else None
+        if reset is not None:
+            headers[f"anthropic-ratelimit-unified-{prefix}-reset"] = str(int(reset.timestamp()))
     return headers if "anthropic-ratelimit-unified-5h-utilization" in headers else None
 
 
@@ -216,7 +238,7 @@ def anthropic_model_windows(body) -> tuple:
         scope = row.get("scope") if isinstance(row.get("scope"), dict) else {}
         model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
         name = model.get("display_name")
-        percent = _number(row.get("percent"))
+        percent = _percentage(row.get("percent"))
         if not isinstance(name, str) or not name.strip() or percent is None:
             continue
         name = name.strip()
@@ -307,7 +329,7 @@ def codex_usage_headers(body) -> Optional[dict]:
     headers: dict = {}
     for slot in ("primary", "secondary"):
         window = rate_limit.get(f"{slot}_window")
-        if not isinstance(window, dict) or _number(window.get("used_percent")) is None:
+        if not isinstance(window, dict) or _percentage(window.get("used_percent")) is None:
             continue
         headers[f"x-codex-{slot}-used-percent"] = str(_number(window["used_percent"]))
         if _number(window.get("reset_at")) is not None:
@@ -325,14 +347,6 @@ def codex_usage_headers(body) -> Optional[dict]:
 
 # ---- scheduling ---------------------------------------------------------------
 
-def interval_for(profile_id: str, observed_at: float) -> float:
-    """5-10 minutes, fixed for a given reading so it is stable across ticks but
-    different per account and per reading — accounts never line up."""
-    digest = hashlib.sha256(f"{profile_id}:{int(observed_at)}".encode()).digest()
-    fraction = int.from_bytes(digest[:4], "big") / 0xFFFFFFFF
-    return BASE_INTERVAL_SECONDS + JITTER_SECONDS * fraction
-
-
 def _human(seconds: float) -> str:
     minutes = round(seconds / 60)
     return f"{minutes} min" if minutes < 90 else f"{round(seconds / 3600, 1):g} h"
@@ -343,32 +357,21 @@ class Scheduler:
         self._clock = clock
         self._state_file = state_file
         self._lock = threading.Lock()
-        self._last_activity: Optional[float] = None
+        self._activity_seen = False
         self._state: Optional[dict] = None  # loaded lazily, never at import
 
-    # -- presence --
+    # -- initial activity wakeup --
     def note_activity(self) -> bool:
-        """Returns True when this ends an idle period (or is the first sign of
-        life), so the caller can check straight away instead of next tick."""
-        now = self._clock()
+        """Wake an initial check on first activity; later reads use the timer."""
         with self._lock:
-            was_idle = not self._active(now)
-            self._last_activity = now
-        return was_idle
-
-    def is_active(self) -> bool:
-        with self._lock:
-            return self._active(self._clock())
-
-    def _active(self, now: float) -> bool:
-        return self._last_activity is not None and now - self._last_activity < IDLE_AFTER_SECONDS
+            first = not self._activity_seen
+            self._activity_seen = True
+        return first
 
     # -- what to read now --
     def due(self, candidates: list[Candidate]) -> list[str]:
         now = self._clock()
         with self._lock:
-            if not self._active(now):
-                return []
             state = self._loaded()
             ready = []
             for c in candidates:
@@ -377,11 +380,17 @@ class Scheduler:
                 entry = state["profiles"].get(c.profile_id)
                 if entry and entry.get("not_before", 0) > now:
                     continue
-                if c.observed_at is not None and now - c.observed_at < interval_for(c.profile_id, c.observed_at):
+                polled_at = state["last_polled_at"].get(c.profile_id)
+                if polled_at is not None and now - polled_at < BASE_INTERVAL_SECONDS:
                     continue
-                ready.append(c)
-        ready.sort(key=lambda c: -1.0 if c.observed_at is None else c.observed_at)
-        return [c.profile_id for c in ready[:MAX_PROBES_PER_TICK]]
+                ready.append((c.profile_id, polled_at))
+        ready.sort(key=lambda entry: -1.0 if entry[1] is None else entry[1])
+        return [profile_id for profile_id, _ in ready[:MAX_PROBES_PER_TICK]]
+
+    def provider_paused(self, provider: str) -> bool:
+        """Recheck between reads: the previous account may have received 429."""
+        with self._lock:
+            return self._loaded()["providers"].get(provider, 0) > self._clock()
 
     # -- what happened --
     def record(self, profile_id: str, provider: str, result: ProbeResult) -> Optional[str]:
@@ -399,17 +408,18 @@ class Scheduler:
             outcome = "failure"
         with self._lock:
             state = self._loaded()
+            state["last_polled_at"][profile_id] = now
             entry = state["profiles"].get(profile_id)
             if outcome == "ok":
                 if entry is not None:
                     del state["profiles"][profile_id]
-                    self._save()
+                self._save()
                 return None
             streak = entry["streak"] + 1 if entry and entry.get("kind") == outcome else 1
             base, ceiling = _BACKOFF[outcome]
             wait = min(base * 2 ** (streak - 1), ceiling)
             if outcome == "rate_limited" and result.retry_after:
-                wait = max(wait, min(result.retry_after, ceiling))
+                wait = max(wait, result.retry_after)
             not_before = now + wait
             state["profiles"][profile_id] = {"kind": outcome, "streak": streak, "not_before": not_before}
             if outcome == "rate_limited":
@@ -433,11 +443,11 @@ class Scheduler:
 
     def _loaded(self) -> dict:
         if self._state is None:
-            state = {"profiles": {}, "providers": {}}
+            state = {"profiles": {}, "providers": {}, "last_polled_at": {}}
             try:
                 data = json.loads(self._file().read_text())
                 if isinstance(data, dict):
-                    for key in ("profiles", "providers"):
+                    for key in ("profiles", "providers", "last_polled_at"):
                         if isinstance(data.get(key), dict):
                             state[key] = data[key]
             except (OSError, json.JSONDecodeError):

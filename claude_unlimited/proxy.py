@@ -98,7 +98,7 @@ def build_upstream_request(
     it against the request's model and the per-model support gate
     (openai_models.claude_effort_for), so this module never guesses and stays
     free of a model-catalogue dependency. None = leave the body untouched."""
-    if len(inbound_body) > 20_000_000:  # 20MB: generous, but not unbounded
+    if len(inbound_body) > 128 * 1024 * 1024:  # 128MiB: room for large Claude Code conversations and images, still bounded
         raise ValueError("request body too large to proxy")
 
     headers = {k: v for k, v in inbound_headers.items() if k.lower() not in _STRIPPED_INBOUND_HEADERS}

@@ -46,9 +46,9 @@ dependencies = ["cryptography>=42"]
 dev = ["pytest>=8"]
 
 [project.urls]
-Homepage = "https://github.com/DevDock-AI/claude-unlimited"
-Repository = "https://github.com/DevDock-AI/claude-unlimited"
-Issues = "https://github.com/DevDock-AI/claude-unlimited/issues"
+Homepage = "https://github.com/nklisch/claude-unlimited"
+Repository = "https://github.com/nklisch/claude-unlimited"
+Issues = "https://github.com/nklisch/claude-unlimited/issues"
 Funding = "https://ko-fi.com/devdock"
 
 [project.scripts]

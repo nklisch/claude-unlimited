@@ -75,7 +75,7 @@ jobs:
             echo "Install or update:"
             echo
             echo '```bash'
-            echo 'curl -fsSL https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.sh | bash'
+            echo 'curl -fsSL https://raw.githubusercontent.com/nklisch/claude-unlimited/main/install.sh | bash'
             echo '```'
           } > release-notes.md
 

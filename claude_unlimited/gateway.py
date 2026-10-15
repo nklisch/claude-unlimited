@@ -22,6 +22,7 @@ from __future__ import annotations
 import http.client
 import itertools
 import json
+import secrets
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -47,9 +48,23 @@ from .router import (
     observe,
     record_credits,
     recover_expired_cooldowns,
+    primary_spent,
+    usage_limited,
+    usage_state,
+    weekly_spent,
 )
-from .upstream import UpstreamResponse
-from .upstream import send as real_send
+from .upstream import (
+    MAX_ATTEMPTS,
+    RETRY_BACKOFF_SECONDS,
+    Trace,
+    UpstreamResponse,
+    failure_fields,
+    provider_request_id,
+    retry_after_seconds,
+    trace_meta,
+    tracing,
+)
+from .upstream import send_with_retry as real_send
 
 MAX_ROTATION_ATTEMPTS = 4  # bounded — never loop the whole pool forever on a bad run
 
@@ -615,7 +630,7 @@ def _may_spend_credits(p: Profile, settings) -> bool:
 
 MESSAGE_ALL_EXHAUSTED = "Claude Unlimited — all profiles are out of capacity."
 
-def _out_of_capacity(rt) -> bool:
+def _out_of_capacity(rt, now: Optional[datetime] = None) -> bool:
     """Whether this Profile has no capacity left, as opposed to being
     unusable for some other reason.
 
@@ -623,14 +638,51 @@ def _out_of_capacity(rt) -> bool:
     both a provider rate-limit and a provider that could not be reached at
     all, and "we could not connect" must never be reported to the user as
     "you are out of quota". The account's own usage is what tells them apart —
-    a cooldown on an account sitting at its switch threshold is its quota
-    running out; a cooldown at 3% is the network.
+    a cooldown on an account sitting at its switch threshold (in either the
+    five-hour or the weekly window) is its quota running out; a cooldown at 3%
+    is the network.
     """
     if rt.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING):
         return True
     return (rt.state == ProfileState.COOLDOWN
-            and rt.last_usage_percent is not None
-            and rt.last_usage_percent >= rt.switch_threshold)
+            and usage_limited(rt, now if now is not None else datetime.now(timezone.utc)))
+
+
+def _failure_summary(exc: BaseException) -> str:
+    """A network failure for the Activity log and the client: the error TYPE and
+    how many attempts were made — never the error's message, which can carry
+    URLs or request details."""
+    attempts = getattr(exc, "upstream_attempts", 1)
+    return f"{type(exc).__name__} after {attempts} attempt{'s' if attempts != 1 else ''}"
+
+
+def _approaching_usage(rt, now: datetime):
+    """The running usage window closest to its own threshold, if near it."""
+    windows = []
+    if primary_spent(rt, now, rt.switch_threshold - APPROACHING_THRESHOLD_BAND):
+        windows.append((rt.window_label or "5h", rt.last_usage_percent, rt.switch_threshold))
+    if weekly_spent(rt, now, rt.weekly_switch_threshold - APPROACHING_THRESHOLD_BAND):
+        windows.append((rt.window_label_7d or "weekly", rt.last_usage_percent_7d, rt.weekly_switch_threshold))
+    return min(windows, key=lambda w: w[2] - w[1]) if windows else None
+
+
+def _return_time(rt, now: datetime) -> Optional[datetime]:
+    """When this out-of-capacity Profile can serve again: the latest of the
+    deadlines that actually hold it — a cooldown's end, and the reset of each
+    usage window that is spent. A healthy window's reset holds nothing, so it
+    is not waited for. With no spent window to point at (a hold whose numbers
+    are gone), its own earliest deadline stands in. None = unknown."""
+    holding = []
+    if rt.state == ProfileState.COOLDOWN and rt.cooldown_until is not None:
+        holding.append(rt.cooldown_until)
+    if rt.resets_at is not None and primary_spent(rt, now):
+        holding.append(rt.resets_at)
+    if rt.resets_at_7d is not None and weekly_spent(rt, now):
+        holding.append(rt.resets_at_7d)
+    if holding:
+        return max(holding)
+    own = [d for d in (rt.resets_at, rt.cooldown_until) if d is not None]
+    return min(own) if own else None
 
 
 def _capacity_exhaustion(snapshot, pool) -> tuple[bool, Optional[datetime]]:
@@ -640,12 +692,12 @@ def _capacity_exhaustion(snapshot, pool) -> tuple[bool, Optional[datetime]]:
     pool's capacity, so a pool of one enabled account that hits its limit is
     exhausted even with three disabled ones beside it.
     """
+    now = datetime.now(timezone.utc)
     enabled = {p.id for p in pool.profiles if p.enabled}
     runtimes = [rt for rt in snapshot.profiles if rt.profile_id in enabled]
-    if not runtimes or not all(_out_of_capacity(rt) for rt in runtimes):
+    if not runtimes or not all(_out_of_capacity(rt, now) for rt in runtimes):
         return False, None
-    deadlines = [d for rt in runtimes
-                 for d in (rt.resets_at, rt.cooldown_until) if d is not None]
+    deadlines = [d for d in (_return_time(rt, now) for rt in runtimes) if d is not None]
     return True, min(deadlines) if deadlines else None
 
 
@@ -699,12 +751,17 @@ class Gateway:
 
     _USED_NOW_GRACE_SECONDS = 900.0  # 15 minutes — see the class docstring
     # Upper bound on how long a single in-flight request can keep a Profile
-    # "Used now". A real streaming request finishes in seconds to a couple of
-    # minutes; anything still marked in-flight past this is a leaked/hung slot
-    # (a client that walked away, an upstream that never closed), so stop
-    # counting it rather than pinning the indicator — and the idle check — on
-    # forever. Generous enough never to drop a genuinely-live request.
-    _IN_FLIGHT_MAX_SECONDS = 300.0  # 5 minutes
+    # "Used now". A request can legitimately be in flight for a long time: each
+    # upstream attempt may wait the full 15-minute socket timeout, up to three
+    # attempts are made on the same account, and a provider Retry-After of up
+    # to 15 minutes is waited out between them (upstream.send_with_retry) —
+    # three 900s attempts plus two 900s waits is 75 minutes, before any
+    # response body even starts to stream. Anything still marked in-flight past
+    # this is a leaked/hung slot (a client that walked away, an upstream that
+    # never closed), so stop counting it rather than pinning the indicator —
+    # and the idle check — on forever. It must stay above that worst case, or a
+    # busy account would be declared idle mid-request.
+    _IN_FLIGHT_MAX_SECONDS = 5400.0  # 90 minutes
     _REFRESH_CHECK_COOLDOWN_SECONDS = 60.0
     # Recovery attempts on a Profile that is ALREADY needs-re-auth get their
     # own, much longer interval.
@@ -917,8 +974,9 @@ class Gateway:
                     restored.pop("state", None)
                     restored.pop("cooldown_until", None)
                 restored_state = restored.pop("state", state)
-                self._runtime[p.id] = ProfileRuntime(
+                restored_rt = ProfileRuntime(
                     profile_id=p.id, priority=p.priority, switch_threshold=p.switch_threshold,
+                    weekly_switch_threshold=p.weekly_switch_threshold,
                     automatic=p.automatic,
                     state=restored_state,
                     credential_seen=p.credential_updated_at,
@@ -928,7 +986,16 @@ class Gateway:
                     leave_on_fable_limit=_leave_on_fable_limit(p, pool.settings),
                     **restored,
                 )
-                state = restored_state
+                if restored_rt.state == ProfileState.ELIGIBLE:
+                    # DRAINING is not persisted; it is re-derived from the usage
+                    # numbers restored alongside. Without this a restart
+                    # reopened every account until its next reading — and one
+                    # whose five-hour window had reset in the meantime looked
+                    # fine even with its weekly window still full (a window past
+                    # its own reset is not restored at all, a running one is).
+                    restored_rt = _replace_runtime(restored_rt, state=usage_state(restored_rt, now_utc))
+                self._runtime[p.id] = restored_rt
+                state = restored_rt.state
                 # A Profile this Gateway has just seen for the first time may
                 # already be near its real expiry (e.g. right after a restart).
                 # The check itself runs in _run_due_credential_checks, OUTSIDE
@@ -936,6 +1003,11 @@ class Gateway:
 
             else:
                 rt = self._runtime[p.id]
+                thresholds_changed = (rt.switch_threshold != p.switch_threshold
+                                      or rt.weekly_switch_threshold != p.weekly_switch_threshold)
+                rt = _replace_runtime(rt, switch_threshold=p.switch_threshold,
+                                      weekly_switch_threshold=p.weekly_switch_threshold)
+                now_utc = datetime.now(timezone.utc)
                 new_state = rt.state
                 credential_refreshed = (
                     p.credential_updated_at is not None and p.credential_updated_at != rt.credential_seen
@@ -963,13 +1035,9 @@ class Gateway:
                     new_state = ProfileState.ELIGIBLE
                     self._queue_recovered_usage_read(p.id)
                 elif (rt.state == ProfileState.DRAINING and p.kind in ("oauth", "codex")
-                        and rt.last_usage_percent is not None and rt.last_usage_percent < p.switch_threshold):
-                    # Raising switch_threshold can put a DRAINING Profile
-                    # back under its own threshold without any new request
-                    # ever happening — re-check the LAST OBSERVED number
-                    # against the CURRENT (just-edited) threshold right
-                    # here, instead of leaving it stuck until the next
-                    # real request notices.
+                        and not usage_limited(rt, now_utc)):
+                    # Raising either threshold can reopen an account now, but
+                    # only when neither of its running windows still holds it.
                     new_state = ProfileState.ELIGIBLE
                 elif (rt.state == ProfileState.EXHAUSTED and p.kind == "api"
                         and p.token_threshold and not _over_token_budget(p)):
@@ -992,11 +1060,11 @@ class Gateway:
                     # the one the user just bought credits for.
                     new_state = ProfileState.ELIGIBLE
                 elif (new_state == ProfileState.ELIGIBLE and not may_spend_credits
-                        and p.kind == "codex" and rt.last_usage_percent is not None
-                        and rt.last_usage_percent >= p.switch_threshold):
-                    # And turning it back off must stop the spending now, for
-                    # the same reason — a Profile only ELIGIBLE because credits
-                    # were allowed has to go back to draining.
+                        and p.kind in ("oauth", "codex")
+                        and (thresholds_changed or p.kind == "codex")
+                        and usage_limited(rt, now_utc)):
+                    # Lowering either threshold takes effect on this sync.
+                    # Codex also rechecks when credit spending is turned off.
                     new_state = ProfileState.DRAINING
                 if new_state not in (ProfileState.DISABLED, ProfileState.AUTH_INVALID) and _over_token_budget(p):
                     # No resets_at (there's no time window here) — stays
@@ -1010,6 +1078,7 @@ class Gateway:
                     new_state = ProfileState.EXHAUSTED
                 self._runtime[p.id] = ProfileRuntime(
                     profile_id=p.id, priority=p.priority, switch_threshold=p.switch_threshold,
+                    weekly_switch_threshold=p.weekly_switch_threshold,
                     automatic=p.automatic, state=new_state,
                     last_usage_percent=rt.last_usage_percent, cooldown_until=rt.cooldown_until,
                     resets_at=rt.resets_at,
@@ -1121,6 +1190,23 @@ class Gateway:
         if guard is not None:
             self._note_assumed_windows(pool_now, guard)
         branch_moves: list[tuple[str, str, str]] = []
+        # One diagnostics Trace per request (see upstream.Trace): its locally
+        # generated id is on every Activity line about this request, across
+        # same-account retries and account failover.
+        trace = Trace(request_id=secrets.token_hex(4))
+        # What this request last failed with, after all the retries an account
+        # got, so that when no other Profile can take it the answer is that
+        # failure — not a misleading "no eligible Profile". At most one of the
+        # two is set, whichever came last:
+        #   last_network_failure — (profile name, the error), a transport failure;
+        #   held — a transient HTTP answer (429 rate limit, 500/502/503/504/529)
+        #          kept aside with its small body so the connection could be
+        #          closed while another account is tried; relayed if none can.
+        last_network_failure: Optional[tuple] = None
+        held: Optional[dict] = None
+        # Why the request is leaving an account, until the next account is
+        # chosen and the move can be logged with it.
+        fallback_note: Optional[dict] = None
         parent_agent_id = project_attribution.parent_agent_id_from_headers(headers)
         # Pins are only CREATED for real message traffic — token counting and
         # other ancillary calls never populate the prompt cache, so pinning on
@@ -1135,6 +1221,9 @@ class Gateway:
         eco_stats = eco.CompactionStats()
 
         for _ in range(MAX_ROTATION_ATTEMPTS):
+            # An earlier attempt may have spent minutes in upstream retries;
+            # routing (and any cooldown recorded below) uses the time it is now.
+            now = datetime.now(timezone.utc)
             # The Profile a pinned request is held to: the pin itself, or —
             # for a subagent — the "Forced in subagents" Profile.
             held_to = forced_profile_id
@@ -1194,10 +1283,20 @@ class Gateway:
             if decision.profile_id is None or decision.profile_id in attempted:
                 if forced_profile_id is not None:
                     activity.record("error", "Pinned Profile unavailable — request rejected",
-                                     meta=f"{held_to}: {decision.reason}, "
-                                          f"client={_client_label(headers)}")
+                                     meta=trace_meta(rid=trace.request_id, model=trace.model,
+                                                     elapsed_s=trace.elapsed(), action="final_rejection",
+                                                     reason=decision.reason, profile_id=held_to,
+                                                     client=_client_label(headers)))
                     return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
                                           error=decision.reason)
+                failed = self._failed_request_result(trace, held, last_network_failure)
+                if failed is not None:
+                    return failed
+                if attempted:
+                    activity.record("error", "Request rejected — no account left to try",
+                                     meta=trace_meta(rid=trace.request_id, model=trace.model,
+                                                     elapsed_s=trace.elapsed(), action="final_rejection",
+                                                     reason="no_eligible_account_left", tried=len(attempted)))
                 exhausted, resets_at = _capacity_exhaustion(snapshot, pool)
                 # Said ONCE per outage, not once per request: a client that
                 # retries in a loop used to write an Activity line and raise a
@@ -1229,6 +1328,12 @@ class Gateway:
 
             profile = pool.get(decision.profile_id)
             attempted.add(profile.id)
+            if fallback_note is not None:
+                activity.record("rotation", f"Request moved {fallback_note['from_profile']} → {profile.name}",
+                                 meta=trace_meta(rid=trace.request_id, model=trace.model, elapsed_s=trace.elapsed(),
+                                                 action="fallback", to_profile=profile.name,
+                                                 to_profile_id=profile.id, **fallback_note))
+                fallback_note = None
             if self._exhaustion_announced:
                 # Capacity is back. Said once, and it re-arms the outage
                 # announcement for next time.
@@ -1245,9 +1350,48 @@ class Gateway:
                 if listing is not None:
                     return self._models_listing_response(profile, path, listing)
 
-            try:
-                credential = secret_store.get_token(profile.id)
-            except Exception:
+            # The credential read gets the same same-account retry the upstream
+            # request gets (2s, then 4s): a secret store that hiccups once says
+            # nothing about the account, and no request has been sent yet. The
+            # waits are outside the gateway lock and change no state; only when
+            # every read has failed does the cooldown below apply.
+            credential = None
+            store_failure: Optional[BaseException] = None
+            for read_attempt in range(1, MAX_ATTEMPTS + 1):
+                try:
+                    credential = secret_store.get_token(profile.id)
+                except Exception as exc:
+                    store_failure = exc
+                    if read_attempt == MAX_ATTEMPTS:
+                        break
+                    wait = RETRY_BACKOFF_SECONDS[read_attempt - 1]
+                    # Class and numeric errno only; the Trace is not on this
+                    # profile yet, so the account fields are given explicitly.
+                    activity.record(
+                        "error",
+                        f"{profile.name} — credential store unavailable ({type(exc).__name__}); retrying the "
+                        f"same account in {wait:.0f}s (attempt {read_attempt + 1} of {MAX_ATTEMPTS}; "
+                        f"account not cooled down)",
+                        meta=trace_meta(rid=trace.request_id, profile=profile.name[:60], profile_id=profile.id,
+                                        elapsed_s=trace.elapsed(), action="retry_same_account",
+                                        reason="credential_store_unavailable", account_cooled_down=False,
+                                        attempt=read_attempt, max_attempts=MAX_ATTEMPTS, backoff_s=wait,
+                                        **failure_fields(exc)))
+                    time.sleep(wait)
+                    continue
+                store_failure = None
+                if read_attempt > 1:
+                    activity.record(
+                        "session",
+                        f"{profile.name} — credential store recovered on retry "
+                        f"(attempt {read_attempt} of {MAX_ATTEMPTS})",
+                        meta=trace_meta(rid=trace.request_id, profile=profile.name[:60], profile_id=profile.id,
+                                        elapsed_s=trace.elapsed(), action="recovered_same_account",
+                                        reason="credential_store_unavailable", account_cooled_down=False,
+                                        attempt=read_attempt, max_attempts=MAX_ATTEMPTS))
+                break
+            if store_failure is not None:
+                exc = store_failure
                 # NOT QuotaExhausted, which this used to report. A credential
                 # store that will not answer is transient — a locked Keychain,
                 # a daemon started before first unlock — and says nothing about
@@ -1258,8 +1402,19 @@ class Gateway:
                 # until the next daemon restart, showing "exhausted" as the
                 # reason. ProviderUnavailable cools it down for a bounded
                 # time and lets it come back on its own.
+                now = datetime.now(timezone.utc)   # the cooldown starts from the time it is now
                 with self._lock:
                     self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
+                # Logged by exception class and numeric errno only: the message
+                # and anything the secret store printed stay out of the log.
+                activity.record("error", f"{profile.name} — credential store unavailable; account cooled down",
+                                 meta=trace_meta(rid=trace.request_id, profile=profile.name[:60],
+                                                 profile_id=profile.id, elapsed_s=trace.elapsed(),
+                                                 action="account_cooldown", reason="credential_store_unavailable",
+                                                 account_cooled_down=True,
+                                                 attempts=read_attempt, max_attempts=MAX_ATTEMPTS,
+                                                 cooldown_s=self._cooldown_seconds(profile.id, now),
+                                                 **failure_fields(exc)))
                 continue
 
             # Compact before the kind branch: oauth, api and codex all send the
@@ -1300,16 +1455,22 @@ class Gateway:
             known_bad = self._default_model_body(profile, eco_body)
             if known_bad is not None:
                 eco_body = known_bad
-            claude_effort = openai_models.claude_effort_for(request_model(eco_body), pool.settings.model_parity)
+            requested_model = request_model(eco_body)
+            trace.start_account(profile.id, profile.name, requested_model)
+            claude_effort = openai_models.claude_effort_for(requested_model, pool.settings.model_parity)
             try:
                 upstream_req = build_upstream_request(profile, credential, method, path, headers, eco_body,
                                                       claude_effort=claude_effort)
-            except ValueError:
+            except ValueError as err:
                 # A structurally invalid inbound request (e.g. over the body
                 # size cap) — no Profile can serve this; retrying the next
                 # one would just repeat the same ValueError until the loop
                 # gives up with a misleading "no eligible profile" error.
-                # Fail the request itself, immediately.
+                # Fail the request itself, immediately. Logged by exception
+                # class and size only, never the error's text or the body.
+                activity.record("error", f"{profile.name} — request rejected before sending",
+                                 meta=trace.meta(action="final_rejection", reason="bad_request",
+                                                 error=type(err).__name__, body_bytes=len(eco_body or body)))
                 return GatewayResult(status=400, headers={}, body_chunks=None, profile_id=None,
                                       error="bad_request")
 
@@ -1326,8 +1487,9 @@ class Gateway:
                 self._in_flight_since.setdefault(profile.id, time.monotonic())
 
             try:
-                resp: UpstreamResponse = self._transport(upstream_req)
-            except (OSError, http.client.HTTPException):
+                with tracing(trace):
+                    resp: UpstreamResponse = self._transport(upstream_req)
+            except (OSError, http.client.HTTPException) as exc:
                 # http.client.HTTPException is NOT an OSError, so catching
                 # only OSError missed a whole real class of transport failure:
                 # BadStatusLine and IncompleteRead from a proxy or middlebox
@@ -1349,19 +1511,33 @@ class Gateway:
                 # observation be overwritten by this thread's stale snapshot —
                 # silently reviving a Profile another thread had just learned
                 # was out of quota.
+                #
+                # The transport has already retried this Profile (see
+                # upstream.send_with_retry) — that is why the cooldown starts
+                # only now, and from the CURRENT time: the attempts may have
+                # taken minutes, and a cooldown counted from when the request
+                # began could already be over.
+                now = datetime.now(timezone.utc)
                 with self._lock:
                     self._mark_profile_idle(profile.id)
                     self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
+                failure = (profile.name, exc)
+                gave_up = dict(account_cooled_down=True, cooldown_s=self._cooldown_seconds(profile.id, now),
+                               attempts=getattr(exc, "upstream_attempts", None) or trace.attempts or None,
+                               max_attempts=MAX_ATTEMPTS if trace.attempts else None,
+                               give_up=trace.give_up, **failure_fields(exc))
                 if forced_profile_id is not None:
                     # No other Profile to fall back to when pinned — fail
                     # the request clearly instead of a pointless immediate
                     # retry of the same unreachable upstream.
                     activity.record("error", f"{profile.name} — could not reach upstream",
-                                     meta="pinned profile, not rotating")
-                    return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
-                                          error="upstream_unreachable")
+                                     meta=trace.meta(action="pinned_no_fallback", **gave_up))
+                    return self._network_failure_result(*failure, pinned=True)
+                last_network_failure, held = failure, None
+                fallback_note = dict(from_profile=profile.name, from_profile_id=profile.id,
+                                     reason="unreachable_after_retries", **failure_fields(exc))
                 activity.record("error", f"{profile.name} — could not reach upstream",
-                                 meta="network error, rotating to next eligible profile")
+                                 meta=trace.meta(action="cooldown_and_fallback", **gave_up))
                 continue
             except BaseException:
                 # Anything else is a bug, and should surface as one — but not
@@ -1371,7 +1547,15 @@ class Gateway:
                     self._mark_profile_idle(profile.id)
                 raise
 
+            now = datetime.now(timezone.utc)   # the attempt(s) above may have taken minutes
             observation = classify(resp.status, filter_response_headers(resp.headers), now)
+            if resp.status in (500, 502, 504) and isinstance(observation, Unknown):
+                # classify() has no class for these. By here the transport has
+                # already retried them, so treat them as it treats 503/529: the
+                # provider is unavailable, cool the account down, and let the
+                # request move on (without a state change choose() would simply
+                # pick this account again).
+                observation = ProviderUnavailable(retry_after_seconds=retry_after_seconds(resp.headers))
 
             if (profile.kind == "api" and profile.default_model
                     and isinstance(observation, Unknown) and observation.status_code in _MODEL_FALLBACK_STATUS_CODES):
@@ -1389,6 +1573,7 @@ class Gateway:
                     # the slot, cool the Profile down, rotate (or fail, when
                     # pinned) exactly as the network-error branch above does.
                     resp.connection.close()
+                    now = datetime.now(timezone.utc)
                     with self._lock:
                         self._mark_profile_idle(profile.id)
                         self._observe(profile.id, ProviderUnavailable(retry_after_seconds=None), now)
@@ -1423,24 +1608,33 @@ class Gateway:
                                                   f"{profile.name} needs re-authentication.", pool.settings)
 
             if isinstance(observation, UsageSnapshot) and new_rt is not None and new_rt.state == ProfileState.ELIGIBLE:
-                near_threshold = observation.percent >= new_rt.switch_threshold - APPROACHING_THRESHOLD_BAND
+                approaching = _approaching_usage(new_rt, datetime.now(timezone.utc))
+                near_threshold = approaching is not None
                 if near_threshold and profile.id not in self._warned_approaching:
                     self._warned_approaching.add(profile.id)
                     notifications.notify_if_enabled(
                         "approaching_threshold", "Claude Unlimited",
-                        f"{profile.name} is approaching its switch threshold "
-                        f"({observation.percent:.0f}% / {new_rt.switch_threshold:.0f}%).", pool.settings)
+                        f"{profile.name} is approaching its {approaching[0]} switch threshold "
+                        f"({approaching[1]:.0f}% / {approaching[2]:.0f}%).", pool.settings)
                 elif not near_threshold:
                     self._warned_approaching.discard(profile.id)
 
+            relay_logged = False   # set once this attempt's failed answer has its own line
             if isinstance(observation, QuotaExhausted):
+                # The quota reason, on the same trace as any retries before it.
+                quota = dict(reason="quota_exhausted", window=observation.window, status=resp.status,
+                             provider_request_id=provider_request_id(resp.headers),
+                             resets_at=observation.resets_at.isoformat() if observation.resets_at else None,
+                             account_state=new_rt.state.value if new_rt is not None else None,
+                             attempts=trace.attempts or None)
                 if forced_profile_id is not None:
                     # No other Profile to fall back to when pinned — relay
                     # Anthropic's real quota-exhausted response as-is
                     # instead of rotating away from the one Profile the
                     # user explicitly chose for this terminal.
                     activity.record("rotation", f"{profile.name} hit its quota",
-                                     meta="pinned profile — returning the real response, not rotating")
+                                     meta=trace.meta(action="pinned_no_fallback", **quota))
+                    relay_logged = True
                 else:
                     # Headers/status only have arrived so far — no body
                     # byte has reached the caller yet. Safe to retry on the
@@ -1448,8 +1642,57 @@ class Gateway:
                     with self._lock:
                         self._mark_profile_idle(profile.id)
                     resp.connection.close()
-                    activity.record("rotation", f"{profile.name} hit its quota", meta="rotating to next eligible profile")
+                    fallback_note = dict(from_profile=profile.name, from_profile_id=profile.id, **quota)
+                    activity.record("rotation", f"{profile.name} hit its quota",
+                                     meta=trace.meta(action="switch_account", **quota))
                     continue
+
+            if isinstance(observation, (ShortRateLimit, ProviderUnavailable)):
+                # A transient HTTP answer that is still here means the transport
+                # has retried it (429 that is only a rate limit, 500, 502, 503,
+                # 504, 529) and the account is now cooled down by _observe.
+                answer = dict(status=resp.status, provider_request_id=provider_request_id(resp.headers),
+                              account_cooled_down=True, cooldown_s=self._cooldown_seconds(profile.id, now),
+                              attempts=trace.attempts or None, max_attempts=MAX_ATTEMPTS if trace.attempts else None,
+                              give_up=trace.give_up)
+                if forced_profile_id is not None:
+                    activity.record("error", f"{profile.name} — HTTP {resp.status}; pinned profile, relaying the provider's answer",
+                                     meta=trace.meta(action="pinned_no_fallback", **answer))
+                    relay_logged = True
+                else:
+                    activity.record("error", f"{profile.name} — HTTP {resp.status} after {trace.attempts or 1} "
+                                              f"attempt{'s' if (trace.attempts or 1) != 1 else ''}; account cooled down",
+                                     meta=trace.meta(action="cooldown_and_fallback", **answer))
+                    # Another account gets the request. This answer is kept
+                    # aside (its body is an error message: bounded, never a
+                    # stream) so this connection is closed now, not held open
+                    # while the next account is tried, and so it can still be
+                    # relayed if no other account can take the request.
+                    try:
+                        error_body, peeked = _peek_error_body(resp)
+                    except (OSError, http.client.HTTPException) as peek_exc:
+                        resp.connection.close()
+                        with self._lock:
+                            self._mark_profile_idle(profile.id)
+                        last_network_failure, held = (profile.name, peek_exc), None
+                        fallback_note = dict(from_profile=profile.name, from_profile_id=profile.id,
+                                             reason="error_body_unreadable", status=resp.status,
+                                             **failure_fields(peek_exc))
+                        continue
+                    if len(error_body) < _MAX_ERROR_BODY_PEEK:
+                        resp.connection.close()
+                        with self._lock:
+                            self._mark_profile_idle(profile.id)
+                        held = dict(profile_id=profile.id, profile_name=profile.name, status=resp.status,
+                                    headers=resp.headers, body=error_body,
+                                    provider_request_id=provider_request_id(resp.headers))
+                        last_network_failure = None
+                        fallback_note = dict(from_profile=profile.name, from_profile_id=profile.id,
+                                             reason="transient_http_after_retries", status=resp.status,
+                                             provider_request_id=held["provider_request_id"])
+                        continue
+                    resp = peeked   # too large to set aside: relay it as it is, below
+                    relay_logged = True
 
             if forced_profile_id is None and not branch_routed:
                 # A pinned session's requests must never move the shared
@@ -1478,6 +1721,20 @@ class Gateway:
                     with self._lock:
                         self._last_active.pop(previous_profile_id, None)
 
+            if resp.status >= 400 and not relay_logged:
+                # An error answer going back to the client with no line of its
+                # own yet: a permanent 400/403/404, an auth rejection, any other
+                # status. Normal successes stay quiet. Status and ids only —
+                # the body is not read to describe it.
+                activity.record("error", f"{profile.name} — HTTP {resp.status}; relaying the provider's answer",
+                                 meta=trace.meta(action="final_relay",
+                                                 reason="auth_rejected" if isinstance(observation, AuthInvalid)
+                                                 else "http_error",
+                                                 status=resp.status,
+                                                 provider_request_id=provider_request_id(resp.headers),
+                                                 attempts=trace.attempts or None,
+                                                 max_attempts=MAX_ATTEMPTS if trace.attempts else None))
+
             project_id = None
             try:
                 session_id = project_attribution.session_id_from_headers(headers)
@@ -1495,6 +1752,9 @@ class Gateway:
             return GatewayResult(status=resp.status, headers=resp.headers, body_chunks=body_chunks,
                                   profile_id=profile.id)
 
+        failed = self._failed_request_result(trace, held, last_network_failure)
+        if failed is not None:
+            return failed
         activity.record("error", "Rotation attempts exhausted without a usable Profile")
         notifications.notify_if_enabled("needs_attention", "Claude Unlimited",
                                           "Rotation attempts exhausted — no usable Profile was found.", pool.settings)
@@ -1710,13 +1970,14 @@ class Gateway:
                                               f"{profile.name} needs re-authentication.", pool.settings)
 
         if isinstance(observation, UsageSnapshot) and new_rt is not None and new_rt.state == ProfileState.ELIGIBLE:
-            near_threshold = observation.percent >= new_rt.switch_threshold - APPROACHING_THRESHOLD_BAND
+            approaching = _approaching_usage(new_rt, datetime.now(timezone.utc))
+            near_threshold = approaching is not None
             if near_threshold and profile.id not in self._warned_approaching:
                 self._warned_approaching.add(profile.id)
                 notifications.notify_if_enabled(
                     "approaching_threshold", "Claude Unlimited",
-                    f"{profile.name} is approaching its switch threshold "
-                    f"({observation.percent:.0f}% / {new_rt.switch_threshold:.0f}%).", pool.settings)
+                    f"{profile.name} is approaching its {approaching[0]} switch threshold "
+                    f"({approaching[1]:.0f}% / {approaching[2]:.0f}%).", pool.settings)
             elif not near_threshold:
                 self._warned_approaching.discard(profile.id)
 
@@ -2712,10 +2973,8 @@ class Gateway:
         rt = self._runtime.get(profile_id)
         if rt is None:
             return
-        headroom = rt.switch_threshold - APPROACHING_THRESHOLD_BAND
-        for percent in (rt.last_usage_percent, rt.last_usage_percent_7d):
-            if percent is not None and percent >= headroom:
-                return   # the account-level numbers already explain this
+        if _approaching_usage(rt, datetime.now(timezone.utc)) is not None:
+            return   # the account-level numbers already explain this
         self._request_usage_recheck(profile_id)
 
     def usage_observed_at(self) -> dict:
@@ -2754,6 +3013,53 @@ class Gateway:
                  "parent_agent_id": pin.parent_agent_id, "profile_id": pin.profile_id}
                 for key, pin in self._branch_pins.items() if pin.last_touch > cutoff
             ]
+
+    def _cooldown_seconds(self, profile_id: str, now: datetime) -> Optional[int]:
+        """Seconds left on this Profile's cooldown, or None when it is not in
+        one. A plain read (the same as the `new_rt` reads in handle())."""
+        rt = self._runtime.get(profile_id)
+        if rt is None or rt.state != ProfileState.COOLDOWN or rt.cooldown_until is None:
+            return None
+        return max(0, round((rt.cooldown_until - now).total_seconds()))
+
+    def _failed_request_result(self, trace: Trace, held: Optional[dict],
+                               last_network_failure: Optional[tuple]) -> Optional[GatewayResult]:
+        """The answer for a request that no account could take after a
+        transient failure, or None when it did not fail that way (the caller
+        then reports capacity as it always did). The real failure is what the
+        client hears — the provider's own final answer, or the network
+        failure — never quota or no-profile wording that would mislead."""
+        if held is not None:
+            activity.record("error", f"{held['profile_name']} — no other account could take the request; "
+                                      f"relaying its HTTP {held['status']} answer",
+                             meta=trace_meta(rid=trace.request_id, model=trace.model, elapsed_s=trace.elapsed(),
+                                             action="final_relay", reason="transient_http_no_alternative",
+                                             profile=held["profile_name"], profile_id=held["profile_id"],
+                                             status=held["status"], provider_request_id=held["provider_request_id"]))
+            body = held["body"]
+            return GatewayResult(status=held["status"], headers=held["headers"],
+                                  body_chunks=iter([body]) if body else iter(()), profile_id=held["profile_id"])
+        if last_network_failure is not None:
+            name, exc = last_network_failure
+            activity.record("error", f"{name} — no other account could take the request; returning the network failure",
+                             meta=trace_meta(rid=trace.request_id, model=trace.model, elapsed_s=trace.elapsed(),
+                                             action="final_rejection", reason="unreachable_no_alternative",
+                                             profile=name, **failure_fields(exc)))
+            return self._network_failure_result(name, exc, pinned=False)
+        return None
+
+    @staticmethod
+    def _network_failure_result(profile_name: str, exc: BaseException, pinned: bool) -> GatewayResult:
+        """The 503 for a request whose upstream could not be reached even after
+        retries and with nowhere else to go: names the real failure instead of
+        the quota / no-eligible-Profile wording that would mislead."""
+        if pinned:
+            detail = f"[claude-unlimited] Could not reach Anthropic for the Profile this session is pinned to ({_failure_summary(exc)})."
+        else:
+            detail = (f"[claude-unlimited] Could not reach Anthropic through {profile_name} "
+                      f"({_failure_summary(exc)}), and no other Profile could take the request.")
+        return GatewayResult(status=503, headers={}, body_chunks=None, profile_id=None,
+                              error="upstream_unreachable", error_detail=detail)
 
     def _mark_profile_idle(self, profile_id: str) -> None:
         """Moves a Profile out of `_in_flight` and starts its "Used now"
@@ -2925,6 +3231,7 @@ class Gateway:
                 # unconditional recovery one.
                 rt = ProfileRuntime(profile_id=p.id, priority=p.priority,
                                     switch_threshold=p.switch_threshold, automatic=p.automatic,
+                                    weekly_switch_threshold=p.weekly_switch_threshold,
                                     state=ProfileState.ELIGIBLE)
             if rt.state == ProfileState.DISABLED or not p.enabled:
                 continue

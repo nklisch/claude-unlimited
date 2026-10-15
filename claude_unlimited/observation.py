@@ -35,7 +35,7 @@ class UsageSnapshot:
     percent: float
     resets_at: Optional[datetime]
     confidence: str  # "measured" | "estimated"
-    percent_7d: Optional[float] = None  # the unified-7d sibling of `percent`; display-only, never drives Rotation
+    percent_7d: Optional[float] = None  # the unified-7d sibling of `percent`; router.usage_state() weighs it against the switch threshold exactly as it does `percent`
     resets_at_7d: Optional[datetime] = None
     # What the two window slots above represent. Anthropic always reports
     # both a 5h and a 7d window, but a codex-kind Profile may report a
@@ -53,6 +53,10 @@ class UsageSnapshot:
 @dataclass(frozen=True)
 class QuotaExhausted:
     resets_at: Optional[datetime]
+    # Which window the provider rejected: "5h" or "7d" (Anthropic's per-window
+    # status headers). None = not reported (the codex backend names none), in
+    # which case `resets_at` is all that is known.
+    window: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -128,10 +132,10 @@ def classify(status_code: int, headers: dict[str, str], now: datetime) -> Observ
         status_7d = headers.get("anthropic-ratelimit-unified-7d-status")
         if status_5h == "rejected":
             resets_at = _parse_reset(headers.get("anthropic-ratelimit-unified-5h-reset"))
-            return QuotaExhausted(resets_at=resets_at)
+            return QuotaExhausted(resets_at=resets_at, window="5h")
         if status_7d == "rejected":
             resets_at = _parse_reset(headers.get("anthropic-ratelimit-unified-7d-reset"))
-            return QuotaExhausted(resets_at=resets_at)
+            return QuotaExhausted(resets_at=resets_at, window="7d")
         retry_after = _parse_float(headers.get("retry-after"))
         return ShortRateLimit(retry_after_seconds=retry_after)
 

@@ -89,7 +89,9 @@ def _unit_contents(port: int) -> str:
         # run — the log is only useful if it is written as it happens.
         "Environment=PYTHONUNBUFFERED=1\n"
         f"ExecStart={exec_start}\n"
-        "Restart=on-failure\n"
+        # Keep the daemon available after clean self-exits as well as crashes.
+        # An explicit systemctl stop still leaves it stopped.
+        "Restart=always\n"
         "RestartSec=2\n"
         f"{log_lines}"
         "\n"

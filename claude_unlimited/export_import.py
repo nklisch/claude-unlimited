@@ -77,6 +77,7 @@ class ExportedProfile:
     forced_for_subagents: bool = False
     # "Leave when Fable is spent". Same reason for the default.
     leave_on_fable_limit: bool = False
+    weekly_switch_threshold: float = 98.0
 
 
 def build_export_bundle(
@@ -102,6 +103,7 @@ def build_export_bundle(
             exported.append(asdict(ExportedProfile(
                 name=p.name, kind=p.kind, base_url=p.base_url, auth_mode=p.auth_mode,
                 priority=p.priority, switch_threshold=p.switch_threshold, enabled=p.enabled,
+                weekly_switch_threshold=p.weekly_switch_threshold,
                 automatic=p.automatic, default_model=p.default_model, force_model=p.force_model,
                 monthly_budget_cap=p.monthly_budget_cap,
                 token_threshold=p.token_threshold,
@@ -201,15 +203,22 @@ def apply_import(
     result = {"profiles_added": 0, "profiles_updated": 0, "profiles_skipped": 0, "settings_applied": False}
 
     if import_profiles:
+        from .profiles import ValidationError, _validate_field_types
+
         with CONFIG_LOCK:
             pool = load_pool()
             by_uuid = {p.account_uuid: p for p in pool.profiles if p.account_uuid}
             for item in parsed.profiles:
                 existing = by_uuid.get(item.get("account_uuid")) if item.get("account_uuid") else None
+                if existing is not None and conflict_strategy == "keep_existing":
+                    result["profiles_skipped"] += 1
+                    continue
+                weekly_threshold = item.get("weekly_switch_threshold", item.get("switch_threshold", 98.0))
+                try:
+                    _validate_field_types(weekly_switch_threshold=weekly_threshold)
+                except ValidationError as exc:
+                    raise ExportImportError(str(exc)) from exc
                 if existing is not None:
-                    if conflict_strategy == "keep_existing":
-                        result["profiles_skipped"] += 1
-                        continue
                     # "Use imported version" means the whole Profile, not
                     # only its credential: every bundle field below is
                     # applied, not just the stored token.
@@ -218,6 +227,7 @@ def apply_import(
                         existing, name=item["name"], base_url=item.get("base_url"),
                         auth_mode=item.get("auth_mode", "api_key"), priority=item.get("priority", 1),
                         switch_threshold=item.get("switch_threshold", 98.0), enabled=item.get("enabled", True),
+                        weekly_switch_threshold=weekly_threshold,
                         automatic=item.get("automatic", True), default_model=item.get("default_model"),
                         force_model=item.get("force_model"),
                         monthly_budget_cap=item.get("monthly_budget_cap"), token_threshold=item.get("token_threshold"),
@@ -236,6 +246,7 @@ def apply_import(
                     id=_secrets.token_hex(8), name=item["name"], kind=item["kind"], base_url=item.get("base_url"),
                     auth_mode=item.get("auth_mode", "api_key"), priority=item.get("priority", 1),
                     switch_threshold=item.get("switch_threshold", 98.0), enabled=item.get("enabled", True),
+                    weekly_switch_threshold=weekly_threshold,
                     automatic=item.get("automatic", True), default_model=item.get("default_model"),
                         force_model=item.get("force_model"),
                     monthly_budget_cap=item.get("monthly_budget_cap"), token_threshold=item.get("token_threshold"),

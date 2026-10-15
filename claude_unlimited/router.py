@@ -6,8 +6,8 @@ touches an upstream, a keychain, or a clock beyond what is passed in, which
 is what keeps them deterministically testable.
 
 Rotation rules:
-  - Sticky: stay on the current Profile until its switch_threshold is crossed
-    or it returns quota-exhausted.
+  - Sticky: stay on the current Profile until either usage window reaches its
+    own switch threshold (five-hour or weekly), or it returns quota-exhausted.
   - Never rotate on a bare short rate-limit; that Profile gets a cooldown,
     not a state change away from ELIGIBLE.
   - Tie-break among equally-eligible Profiles: lowest priority number wins;
@@ -17,7 +17,7 @@ Rotation rules:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
 
@@ -54,7 +54,7 @@ class ProfileRuntime:
     last_usage_percent: Optional[float] = None
     cooldown_until: Optional[datetime] = None
     resets_at: Optional[datetime] = None
-    last_usage_percent_7d: Optional[float] = None  # display-only, never drives Rotation
+    last_usage_percent_7d: Optional[float] = None  # the second (weekly) window
     resets_at_7d: Optional[datetime] = None
     window_label: Optional[str] = None  # None means "assume 5h"; see observation.UsageSnapshot
     window_label_7d: Optional[str] = None  # None means "assume 7d" (Anthropic) or "no second window" (codex); the Dashboard tells them apart by whether last_usage_percent_7d is also None
@@ -92,6 +92,7 @@ class ProfileRuntime:
     # 0 by a successful UsageSnapshot, or by an observation that does carry a
     # retry_after_seconds.
     consecutive_unretryable_failures: int = 0
+    weekly_switch_threshold: float = 98.0
 
 
 @dataclass
@@ -307,33 +308,56 @@ def observe(pool: PoolSnapshot, profile_id: str, observation: Observation, now: 
 
 def _apply(p: ProfileRuntime, observation: Observation, now: datetime) -> ProfileRuntime:
     if isinstance(observation, UsageSnapshot):
-        state = ProfileState.DRAINING if observation.percent >= p.switch_threshold else ProfileState.ELIGIBLE
-        if state is ProfileState.DRAINING and _credits_can_serve(p):
-            # Same reasoning as the QuotaExhausted branch: a credit-funded
-            # account is not draining towards unavailability, so the switch
-            # threshold — which exists to leave plan headroom — does not
-            # apply to it.
-            state = ProfileState.ELIGIBLE
+        percent_7d, resets_at_7d = observation.percent_7d, observation.resets_at_7d
+        window_label_7d = observation.window_label_7d
+        if (percent_7d is None and p.last_usage_percent_7d is not None
+                and p.resets_at_7d is not None and now < p.resets_at_7d):
+            # This snapshot says nothing about the weekly window (a response
+            # without its headers, a usage read that left it out). That is
+            # absence, not a reset: a weekly limit still inside its own
+            # window stays known, or the next snapshot would reopen a
+            # spent account. It lapses by itself at its own reset time (one
+            # with no known reset time could never lapse, so is not kept).
+            percent_7d, resets_at_7d = p.last_usage_percent_7d, p.resets_at_7d
+            if window_label_7d is None:
+                window_label_7d = p.window_label_7d
         # A real response carries no per-model windows (model_windows None):
         # keep the last usage read's, or every request would erase them.
         model_usage = p.model_usage if observation.model_windows is None else tuple(observation.model_windows)
-        return _replace(p, state=state, last_usage_percent=observation.percent, resets_at=observation.resets_at,
-                         last_usage_percent_7d=observation.percent_7d, resets_at_7d=observation.resets_at_7d,
-                         window_label=observation.window_label, window_label_7d=observation.window_label_7d,
-                         model_usage=model_usage,
-                         consecutive_unretryable_failures=0)  # a success: this Profile works again
+        updated = _replace(p, last_usage_percent=observation.percent, resets_at=observation.resets_at,
+                            last_usage_percent_7d=percent_7d, resets_at_7d=resets_at_7d,
+                            window_label=observation.window_label, window_label_7d=window_label_7d,
+                            model_usage=model_usage,
+                            consecutive_unretryable_failures=0)  # a success: this Profile works again
+        # Each window has its own threshold; the credit exception applies to either.
+        return _replace(updated, state=usage_state(updated, now))
 
     if isinstance(observation, QuotaExhausted):
+        # The rejection is recorded on the window that was rejected, so what
+        # holds the account is always visible in the window numbers (and so
+        # recover_expired_cooldowns() can tell a real hold from an unrelated
+        # healthy window's reset):
+        #   * weekly ("7d"): the weekly fields only. The five-hour numbers are
+        #     left exactly as they were — the weekly deadline must not be
+        #     written over them. With no reset time reported there is nothing
+        #     to record, and the account is held by its state alone.
+        #   * five-hour, or a backend that does not say which (codex): the
+        #     first window, spent until the reported reset.
+        if observation.window == "7d":
+            changes = {}
+            if observation.resets_at is not None:
+                changes = dict(last_usage_percent_7d=100.0, resets_at_7d=observation.resets_at)
+        else:
+            changes = dict(resets_at=observation.resets_at, last_usage_percent=100.0)
         if _credits_can_serve(p):
             # The plan window is spent, but this Profile has prepaid credits
             # and the user has opted into spending them. The account can
             # still serve, so marking it EXHAUSTED would idle an account that
-            # works. resets_at is still recorded: when the window refills we
+            # works. The reset is still recorded: when the window refills we
             # want the number, and spend_on_credits() below is what the UI
             # reads to say the requests are being paid for.
-            return _replace(p, state=ProfileState.ELIGIBLE, resets_at=observation.resets_at,
-                             last_usage_percent=100.0)
-        return _replace(p, state=ProfileState.EXHAUSTED, resets_at=observation.resets_at)
+            return _replace(p, state=ProfileState.ELIGIBLE, **changes)
+        return _replace(p, state=ProfileState.EXHAUSTED, **changes)
 
     if isinstance(observation, ShortRateLimit):
         streak = _next_unretryable_streak(p, observation.retry_after_seconds)
@@ -389,29 +413,100 @@ def _credits_can_serve(p: ProfileRuntime) -> bool:
     return bool(p.may_spend_credits and p.credits_has)
 
 
-def spending_on_credits(p: ProfileRuntime) -> bool:
+def spending_on_credits(p: ProfileRuntime, now: Optional[datetime] = None) -> bool:
     """True when this Profile is being served from paid credits rather than
-    its plan window — i.e. the window is at or past the point where it would
-    otherwise have stopped. What the Dashboard, the HUD and /api/profiles
-    show so nobody spends money without seeing it."""
+    its plan window — i.e. a window (the five-hour or the weekly one) is at or
+    past the point where it would otherwise have stopped. What the Dashboard,
+    the HUD and /api/profiles show so nobody spends money without seeing it.
+
+    `now` is optional only so the Dashboard's existing one-argument call keeps
+    working; it falls back to the wall clock."""
     if not _credits_can_serve(p):
         return False
-    used = p.last_usage_percent
-    return used is not None and used >= p.switch_threshold
+    return usage_limited(p, now if now is not None else datetime.now(timezone.utc))
+
+
+def _window_running(resets_at: Optional[datetime], now: datetime) -> bool:
+    """Whether a window with this reset time is still inside its period. No
+    reset time at all counts as running: there is nothing to say it ended."""
+    return resets_at is None or now < resets_at
+
+
+def _window_spent(percent: Optional[float], resets_at: Optional[datetime],
+                  threshold: float, now: datetime) -> bool:
+    """One usage window at or past the switch threshold and not yet reset. A
+    reading past its own reset is stale, not spent — the same rule
+    fable_spent() applies to a model window."""
+    return percent is not None and percent >= threshold and _window_running(resets_at, now)
+
+
+def primary_spent(p: ProfileRuntime, now: datetime, threshold: Optional[float] = None) -> bool:
+    """Whether the first (five-hour) usage window is at or past the threshold
+    and still running."""
+    return _window_spent(p.last_usage_percent, p.resets_at,
+                         p.switch_threshold if threshold is None else threshold, now)
+
+
+def weekly_spent(p: ProfileRuntime, now: datetime, threshold: Optional[float] = None) -> bool:
+    """Whether the weekly (second) usage window is at or past the threshold
+    and still running."""
+    return _window_spent(p.last_usage_percent_7d, p.resets_at_7d,
+                         p.weekly_switch_threshold if threshold is None else threshold, now)
+
+
+def usage_limited(p: ProfileRuntime, now: datetime, threshold: Optional[float] = None) -> bool:
+    """Whether EITHER running usage window has reached its own switch threshold.
+    Each window ends at its OWN reset: the
+    five-hour window resetting does not reopen an account whose weekly window
+    is still full, and the other way round. `threshold` defaults to the
+    two configured values; an explicit override applies to both windows."""
+    return primary_spent(p, now, threshold) or weekly_spent(p, now, threshold)
+
+
+def usage_state(p: ProfileRuntime, now: datetime) -> ProfileState:
+    """The state the usage windows alone imply: DRAINING while either window is
+    spent, else ELIGIBLE — except that a credit-funded account is not draining
+    towards unavailability, so the switch threshold (which exists to leave plan
+    headroom) does not apply to it. Same reasoning as the QuotaExhausted
+    branch of _apply."""
+    if usage_limited(p, now) and not _credits_can_serve(p):
+        return ProfileState.DRAINING
+    return ProfileState.ELIGIBLE
 
 
 def recover_expired_cooldowns(pool: PoolSnapshot, now: datetime) -> PoolSnapshot:
-    """Moves any COOLDOWN/EXHAUSTED profile whose deadline has passed back to
-    ELIGIBLE. Call this before choose() on each request boundary."""
+    """Moves any COOLDOWN/EXHAUSTED/DRAINING profile whose deadline has passed
+    back to ELIGIBLE. Call this before choose() on each request boundary.
+
+    Each usage window is cleared at its OWN reset, and the account only
+    reopens once no running window is still at the switch threshold: the
+    five-hour window resetting does not reopen an account whose weekly window
+    is still full (it stays as it is until the weekly reset), and the other
+    way round. Another window's reset still being ahead holds nothing back —
+    only a window that is actually spent does, and a rejection (see _apply)
+    is recorded as exactly that. An expired cooldown reopens the account the
+    same way — the cooldown ending says nothing about the quota."""
 
     new_profiles = []
     for p in pool.profiles:
         if p.state == ProfileState.COOLDOWN and p.cooldown_until is not None and now >= p.cooldown_until:
-            new_profiles.append(_replace(p, state=ProfileState.ELIGIBLE, cooldown_until=None))
-        elif p.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING) and p.resets_at is not None and now >= p.resets_at:
-            new_profiles.append(_replace(p, state=ProfileState.ELIGIBLE, resets_at=None, last_usage_percent=None))
-        else:
-            new_profiles.append(p)
+            cooled = _replace(p, cooldown_until=None)
+            new_profiles.append(_replace(cooled, state=usage_state(cooled, now)))
+            continue
+        if p.state in (ProfileState.EXHAUSTED, ProfileState.DRAINING):
+            primary_reset = p.resets_at is not None and now >= p.resets_at
+            weekly_reset = p.resets_at_7d is not None and now >= p.resets_at_7d
+            if primary_reset or weekly_reset:
+                q = p
+                if primary_reset:
+                    q = _replace(q, resets_at=None, last_usage_percent=None)
+                if weekly_reset:
+                    q = _replace(q, resets_at_7d=None, last_usage_percent_7d=None)
+                if usage_state(q, now) is ProfileState.ELIGIBLE:
+                    q = _replace(q, state=ProfileState.ELIGIBLE)
+                new_profiles.append(q)
+                continue
+        new_profiles.append(p)
     return PoolSnapshot(profiles=new_profiles, current_profile_id=pool.current_profile_id)
 
 

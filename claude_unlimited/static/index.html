@@ -308,6 +308,7 @@
   .bar-group { flex: 1; min-width: 140px; }
   .bar-label-row { display: flex; justify-content: space-between; font-size: var(--fs-micro); color: var(--text-dim); margin-bottom: 4px; }
   .bar-label-row .mono-num { color: var(--text); font-weight: 600; }
+  .bar-reset { margin-top: 6px; font-size: 10px; line-height: 1.4; color: var(--text-faint); }
   /* .bar-visual stacks three rows: the gray threshold number above its
      marker line, the track, and the usage number below where the bar ends.
      Each figure sits at its own x-position so neither can be misread as the
@@ -1621,7 +1622,7 @@
         <div class="field-row">
           <div class="field-text">
             <div class="field-title" data-i18n="settings.daemon.usage_fresh_label">Keep usage up to date</div>
-            <div class="field-sub" data-i18n="settings.daemon.usage_fresh_sub">While you're active, reads each subscription account's usage every 5–10 minutes from the providers' read-only usage endpoints — no messages are sent. Pauses after 30 minutes idle, and waits longer whenever a provider pushes back. For a Claude account it also shows any per-model weekly limit, such as Fable.</div>
+            <div class="field-sub" data-i18n="settings.daemon.usage_fresh_sub">Reads each enabled subscription account's usage about every 5 minutes from the providers' read-only usage endpoints, including while idle or serving requests — no messages are sent. Waits longer only when provider backoff applies. For a Claude account it also shows any per-model weekly limit, such as Fable.</div>
           </div>
           <div class="toggle" id="usageFreshToggle" data-field="keep_usage_fresh"><div class="toggle-knob"></div></div>
         </div>
@@ -2456,11 +2457,19 @@
           <div class="advanced-body open" id="advancedBody">
             <div class="adv-row">
               <div class="field-group" id="f_threshold_wrap">
-                <div class="field-label" data-i18n="modal.add_profile.threshold_label">Switch threshold</div>
+                <div class="field-label" data-i18n="modal.add_profile.primary_threshold_label">5-hour switch threshold</div>
                 <div class="stepper">
                   <div class="stepper-btn" data-step="f_threshold" data-delta="-1">–</div>
                   <div class="stepper-val"><span id="f_threshold_val">98</span>%</div>
                   <div class="stepper-btn" data-step="f_threshold" data-delta="1">+</div>
+                </div>
+              </div>
+              <div class="field-group" id="f_weekly_threshold_wrap">
+                <div class="field-label" data-i18n="modal.add_profile.weekly_threshold_label">Weekly switch threshold</div>
+                <div class="stepper">
+                  <div class="stepper-btn" data-step="f_weekly_threshold" data-delta="-1">–</div>
+                  <div class="stepper-val"><span id="f_weekly_threshold_val">98</span>%</div>
+                  <div class="stepper-btn" data-step="f_weekly_threshold" data-delta="1">+</div>
                 </div>
               </div>
               <div class="field-group" id="f_token_threshold_wrap" style="display:none;">
@@ -2785,13 +2794,24 @@
       <div id="pd_api_usage" class="bars-block" style="display:none"></div>
       <div class="field-row" id="pd_threshold_row_oauth">
         <div class="field-text">
-          <div class="field-title" data-i18n="modal.add_profile.threshold_label">Switch threshold</div>
-          <div class="field-sub" data-i18n="modal.detail.threshold_sub">Rotate away from this profile at this usage %</div>
+          <div class="field-title" data-i18n="modal.add_profile.primary_threshold_label">5-hour switch threshold</div>
+          <div class="field-sub" data-i18n="modal.detail.threshold_sub">Rotate away at this account's primary-window usage %. Either window can trigger a switch.</div>
         </div>
         <div class="stepper">
           <div class="stepper-btn" data-pd-step="threshold" data-delta="-1">–</div>
           <div class="stepper-val"><span id="pd_threshold_val">98</span>%</div>
           <div class="stepper-btn" data-pd-step="threshold" data-delta="1">+</div>
+        </div>
+      </div>
+      <div class="field-row" id="pd_weekly_threshold_row">
+        <div class="field-text">
+          <div class="field-title" data-i18n="modal.add_profile.weekly_threshold_label">Weekly switch threshold</div>
+          <div class="field-sub" data-i18n="modal.detail.weekly_threshold_sub">Rotate away at this account's weekly usage %. A 5-hour reset does not reset weekly usage.</div>
+        </div>
+        <div class="stepper">
+          <div class="stepper-btn" data-pd-step="weekly_threshold" data-delta="-1">–</div>
+          <div class="stepper-val"><span id="pd_weekly_threshold_val">98</span>%</div>
+          <div class="stepper-btn" data-pd-step="weekly_threshold" data-delta="1">+</div>
         </div>
       </div>
       <div class="field-row" id="pd_threshold_row_api" style="display:none">

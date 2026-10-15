@@ -1376,9 +1376,8 @@ function barColor(statusWord, percent, threshold) {
   return c ? c.color : 'var(--good)';
 }
 
-// The 7d/weekly bar has no switch_threshold concept to be relative to (see
-// renderProfileCard's bar7d call, threshold is always null there) — fixed
-// absolute bands instead: green under 75%, yellow 75-90%, red 90%+.
+// Per-model weekly windows retain their own fixed display bands. The
+// account-wide weekly bar instead uses its configurable threshold.
 function weeklyBarColor(statusWord, percent) {
   if (_isNeutralStatus(statusWord) && percent !== null && percent !== undefined) {
     if (percent >= 90) return 'var(--bad)';
@@ -1424,13 +1423,29 @@ function _renderBarVisual(pct, thresholdPct, has, color, usageText, thresholdTex
       </div>`;
 }
 
-function renderUsageBar(label, pct, has, threshold, color) {
+function renderUsageReset(resetAt) {
+  const reset = resetAt ? new Date(resetAt) : null;
+  if (!reset || !Number.isFinite(reset.getTime())) {
+    return `<div class="bar-reset">${esc(t('profiles.no_reset_data'))}</div>`;
+  }
+  const exact = reset.toLocaleString(undefined, {
+    year: 'numeric', month: 'short', day: 'numeric',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short',
+  });
+  const label = reset.getTime() <= Date.now()
+    ? esc(t('profile.reset_due'))
+    : `${esc(t('profile.resets_in'))} <span class="mono-num">${esc(formatFutureRelative(resetAt))}</span>`;
+  return `<div class="bar-reset" title="${esc(exact)}">${label}</div>`;
+}
+
+function renderUsageBar(label, pct, has, threshold, color, resetAt = null) {
   const usageText = has ? `${pct}%` : esc(t('profile.not_observed'));
   const thresholdText = (threshold !== null && threshold !== undefined) ? `${threshold}%` : '';
   return `
     <div class="bar-group">
       <div class="bar-label-row"><span>${esc(label)}</span></div>
       ${_renderBarVisual(has ? pct : 0, threshold, has, color, usageText, thresholdText)}
+      ${renderUsageReset(resetAt)}
     </div>`;
 }
 
@@ -1440,7 +1455,7 @@ function renderUsageBar(label, pct, has, threshold, color) {
 function modelUsageBars(p) {
   return (p.model_usage || []).map((w) =>
     renderUsageBar(t('profile.model_window').replace('{model}', w.name), w.percent, true, null,
-      weeklyBarColor(p.status_word, w.percent))).join('');
+      weeklyBarColor(p.status_word, w.percent), w.resets_at)).join('');
 }
 
 // Shown only while requests are actually being charged to prepaid credits
@@ -1552,12 +1567,12 @@ function renderProfileCard(p) {
   const has5h = p.usage_5h_percent !== null && p.usage_5h_percent !== undefined;
   const has7d = p.usage_7d_percent !== null && p.usage_7d_percent !== undefined;
   const fillColor5h = barColor(p.status_word, p.usage_5h_percent, p.switch_threshold);
-  const fillColor7d = weeklyBarColor(p.status_word, p.usage_7d_percent);
+  const fillColor7d = barColor(p.status_word, p.usage_7d_percent, p.weekly_switch_threshold);
 
-  const bar5h = renderUsageBar(usageWindowLabel(p.usage_window_label, primaryWindowFallbackKey(p)), p.usage_5h_percent, has5h, p.switch_threshold, fillColor5h);
+  const bar5h = renderUsageBar(usageWindowLabel(p.usage_window_label, primaryWindowFallbackKey(p)), p.usage_5h_percent, has5h, p.switch_threshold, fillColor5h, p.usage_5h_resets_at);
   // No second window (codex accounts, typically) — render nothing rather
   // than an empty "7d" bar for a window that doesn't exist.
-  const bar7d = has7d ? renderUsageBar(usageWindowLabel(p.usage_window_label_7d, secondaryWindowFallbackKey(p)), p.usage_7d_percent, has7d, null, fillColor7d) : '';
+  const bar7d = has7d ? renderUsageBar(usageWindowLabel(p.usage_window_label_7d, secondaryWindowFallbackKey(p)), p.usage_7d_percent, has7d, p.weekly_switch_threshold, fillColor7d, p.usage_7d_resets_at) : '';
 
   // API keys have no session-based rate-limit window, so tokens and
   // estimated cost are the meaningful figures for a metered key. With a
@@ -1576,9 +1591,6 @@ function renderProfileCard(p) {
     <div class="bar-group">
       <div class="bar-label-row"><span>${esc(t('profile.cost_estimated'))}</span><span class="mono-num">${p.cost_usd_total !== null ? '$' + p.cost_usd_total.toFixed(2) : '—'}</span></div>
     </div>`;
-
-  const resetIn = formatFutureRelative(p.usage_5h_resets_at);
-  const footResets = resetIn ? `<span>${esc(t('profile.resets_in'))} <span class="mono-num">${esc(resetIn)}</span></span>` : '';
 
   const tagStyle = p.tag_color ? ` style="--tag-color:${esc(p.tag_color)}"` : '';
   const tagClass = p.tag_color ? ' has-tag' : '';
@@ -1602,7 +1614,6 @@ function renderProfileCard(p) {
       </div>
       <div class="p-bars">${usageBlock}</div>
       <div class="p-foot">
-        ${footResets}
         <div class="p-foot-spacer"></div>
         <span>${p.automatic ? esc(t('profile.auto_rotation_on')) : esc(t('profile.manual_only'))}</span>
         <div class="toggle ${p.enabled ? '' : 'off'} toggle-enabled"><div class="toggle-knob"></div></div>
@@ -1642,6 +1653,7 @@ async function loadProfiles() {
   try {
     const { profiles } = await api('/api/profiles');
     _lastProfiles = profiles;
+    if (_pdProfileId) renderProfileDetailUsage();
     refreshCodexCreditsVisibility();
     renderStatStrip(profiles);
     if (!profiles.length) {
@@ -1686,13 +1698,10 @@ function renderProfileTableRow(p) {
   const has5h = p.usage_5h_percent !== null && p.usage_5h_percent !== undefined;
   const has7d = p.usage_7d_percent !== null && p.usage_7d_percent !== undefined;
 
-  const barCell = (rawLabel, pct, has, isWeekly) => {
-    // The 7d/weekly column has no switch_threshold concept (same as the
-    // card and Detail modal) — no marker to draw, and its own fixed-band
-    // color rule (weeklyBarColor) instead of the 5h column's
-    // threshold-relative one.
-    const fillColor = isWeekly ? weeklyBarColor(p.status_word, pct) : barColor(p.status_word, pct, p.switch_threshold);
-    const marker = isWeekly ? '' : `<div class="bar-threshold" style="left:${Math.min(100, p.switch_threshold)}%"></div>`;
+  const barCell = (rawLabel, pct, has, isWeekly, resetAt) => {
+    const threshold = isWeekly ? p.weekly_switch_threshold : p.switch_threshold;
+    const fillColor = barColor(p.status_word, pct, threshold);
+    const marker = `<div class="bar-threshold" style="left:${Math.min(100, threshold)}%"></div>`;
     // Only show a label word when there is a real one (a codex window
     // duration) — the column header already says "5h"/"7d" for oauth, and
     // this column is narrow.
@@ -1700,9 +1709,9 @@ function renderProfileTableRow(p) {
     return has
       ? `<div class="bar-cell"><div class="bar-label-row">${labelSpan}<span class="mono-num" style="color:${fillColor}">${pct}%</span></div>
           <div class="bar-track"><div class="bar-fill" style="width:${Math.min(100, pct)}%;background:${fillColor}"></div>
-          ${marker}</div></div>`
+          ${marker}</div>${renderUsageReset(resetAt)}</div>`
       : `<div class="bar-cell"><div class="bar-label-row">${labelSpan}<span class="mono-num" style="color:var(--text-faint);font-size:10px;">${esc(t('profile.not_observed'))}</span></div>
-          <div class="bar-track">${marker}</div></div>`;
+          <div class="bar-track">${marker}</div>${renderUsageReset(resetAt)}</div>`;
   };
 
   // API keys have no session-based rate-limit window, so tokens and
@@ -1715,7 +1724,7 @@ function renderProfileTableRow(p) {
   // row is a CSS grid with a fixed column template, so an omitted child
   // would shift every column after it.
   const usageCells = p.kind !== 'api'
-    ? `${barCell(usageWindowLabelOrBlank(p.usage_window_label), p.usage_5h_percent, has5h, false)}${has7d ? barCell(usageWindowLabelOrBlank(p.usage_window_label_7d), p.usage_7d_percent, has7d, true) : '<div class="bar-cell"></div>'}`
+    ? `${barCell(usageWindowLabelOrBlank(p.usage_window_label), p.usage_5h_percent, has5h, false, p.usage_5h_resets_at)}${has7d ? barCell(usageWindowLabelOrBlank(p.usage_window_label_7d), p.usage_7d_percent, has7d, true, p.usage_7d_resets_at) : '<div class="bar-cell"></div>'}`
     : `${usageCell(t('profile.tokens_used'), formatTokenCount(p.tokens_total))}${usageCell(t('profile.cost_estimated'), p.cost_usd_total !== null ? '$' + p.cost_usd_total.toFixed(2) : '—')}`;
 
   const tagStyle = p.tag_color ? ` style="--tag-color:${esc(p.tag_color)}"` : '';
@@ -1734,7 +1743,7 @@ function renderProfileTableRow(p) {
         </div>
       </div>
       ${usageCells}
-      <div class="threshold-chip" data-action="threshold" title="${esc(t('profiles.edit_threshold'))}">
+      <div class="threshold-chip" data-action="threshold" title="${esc(t(p.kind === 'api' ? 'profiles.edit_threshold' : 'profiles.edit_primary_threshold'))}">
         ${p.kind === 'api' ? (p.token_threshold ? esc(formatTokenCount(p.token_threshold)) : esc(t('modal.detail.token_threshold_placeholder'))) : `${p.switch_threshold}%`}
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20l4.2-.7L19 8.5a2 2 0 0 0 0-2.8l-.7-.7a2 2 0 0 0-2.8 0L4.7 15.8 4 20Z"/></svg>
       </div>
@@ -1773,6 +1782,7 @@ async function loadProfilesTable() {
   try {
     const { profiles } = await api('/api/profiles');
     _lastProfiles = profiles;
+    if (_pdProfileId) renderProfileDetailUsage();
     if (sub) {
       const enabledCount = profiles.filter((p) => p.enabled).length;
       const activeName = (_lastStatus && _lastStatus.current_profile_name) || null;
@@ -1833,7 +1843,7 @@ async function loadProfilesTable() {
       const next = window.prompt(t('profiles.prompt_threshold'), current ? String(current.switch_threshold) : '98');
       if (next === null) return;
       const num = Number(next);
-      if (!Number.isFinite(num) || num < 1 || num > 100) return;
+      if (!Number.isFinite(num) || num < 0 || num > 100) return;
       await api(`/api/profiles/${id}`, { method: 'PATCH', body: JSON.stringify({ switch_threshold: num }) });
       await loadProfilesTable();
       await loadProfiles();
@@ -2083,6 +2093,22 @@ async function submitConfirmModal() {
 
 let _pdProfileId = null;
 
+// Polling refreshes only this read-only block, leaving every unsaved edit alone.
+function renderProfileDetailUsage(p = _lastProfiles.find((x) => x.id === _pdProfileId)) {
+  if (!p || p.kind === 'api') return;
+  const has5h = p.usage_5h_percent !== null && p.usage_5h_percent !== undefined;
+  const has7d = p.usage_7d_percent !== null && p.usage_7d_percent !== undefined;
+  const barGroup = (label, pct, has, threshold, resetAt) =>
+    renderUsageBar(label, pct, has, threshold, barColor(p.status_word, pct, threshold), resetAt);
+  // Keep absent secondary windows absent, including on Codex accounts.
+  setLiveHtml(document.getElementById('pd_bars'),
+    barGroup(usageWindowLabel(p.usage_window_label, primaryWindowFallbackKey(p)), p.usage_5h_percent, has5h, p.switch_threshold, p.usage_5h_resets_at) +
+    (has7d ? barGroup(usageWindowLabel(p.usage_window_label_7d, secondaryWindowFallbackKey(p)), p.usage_7d_percent, has7d, p.weekly_switch_threshold, p.usage_7d_resets_at) : '') +
+    modelUsageBars(p) +
+    ((p.model_usage || []).length ? `<div class="field-sub">${esc(t('profile.model_window_note'))}</div>` : '') +
+    creditsDetailLine(p));
+}
+
 function openProfileDetailModal(profileId) {
   const p = _lastProfiles.find((x) => x.id === profileId);
   if (!p) return;
@@ -2143,6 +2169,7 @@ function openProfileDetailModal(profileId) {
   document.getElementById('pd_bars').style.display = isApi ? 'none' : '';
   document.getElementById('pd_api_usage').style.display = isApi ? '' : 'none';
   document.getElementById('pd_threshold_row_oauth').style.display = isApi ? 'none' : '';
+  document.getElementById('pd_weekly_threshold_row').style.display = isApi ? 'none' : '';
   document.getElementById('pd_threshold_row_api').style.display = isApi ? '' : 'none';
 
   if (isApi) {
@@ -2161,22 +2188,9 @@ function openProfileDetailModal(profileId) {
       </div>`;
     document.getElementById('pd_token_threshold_input').value = p.token_threshold != null ? p.token_threshold : '';
   } else {
-    const has5h = p.usage_5h_percent !== null && p.usage_5h_percent !== undefined;
-    const has7d = p.usage_7d_percent !== null && p.usage_7d_percent !== undefined;
-    const barGroup = (label, pct, has, showThreshold) =>
-      renderUsageBar(label, pct, has, showThreshold ? p.switch_threshold : null,
-        showThreshold ? barColor(p.status_word, pct, p.switch_threshold) : weeklyBarColor(p.status_word, pct));
-    const resetIn = formatFutureRelative(p.usage_5h_resets_at);
-    // No second window (codex accounts, typically) — render nothing rather
-    // than an empty "7d" bar-group. See usageWindowLabel.
-    document.getElementById('pd_bars').innerHTML =
-      barGroup(usageWindowLabel(p.usage_window_label, primaryWindowFallbackKey(p)), p.usage_5h_percent, has5h, true) +
-      (has7d ? barGroup(usageWindowLabel(p.usage_window_label_7d, secondaryWindowFallbackKey(p)), p.usage_7d_percent, has7d, false) : '') +
-      modelUsageBars(p) +
-      `<div class="field-sub">${resetIn ? `${t('profile.resets_in')} ${resetIn}` : t('profiles.no_reset_data')}</div>` +
-      ((p.model_usage || []).length ? `<div class="field-sub">${esc(t('profile.model_window_note'))}</div>` : '') +
-      creditsDetailLine(p);
+    renderProfileDetailUsage(p);
     document.getElementById('pd_threshold_val').textContent = String(p.switch_threshold);
+    document.getElementById('pd_weekly_threshold_val').textContent = String(p.weekly_switch_threshold);
   }
 
   document.getElementById('pd_priority_val').textContent = String(p.priority);
@@ -2228,6 +2242,7 @@ async function saveProfileDetail() {
     payload.monthly_budget_cap = rawBudget === '' ? null : Number(rawBudget);
   } else {
     payload.switch_threshold = Number(document.getElementById('pd_threshold_val').textContent);
+    payload.weekly_switch_threshold = Number(document.getElementById('pd_weekly_threshold_val').textContent);
   }
   if (isCodex) {
     payload.codex_model = document.getElementById('pd_codex_model').dataset.value || null;
@@ -3528,6 +3543,7 @@ function selectType(type) {
   // switch_threshold's slot — the same swap as the Profile Detail modal and
   // the Profiles table chip. codex uses switch_threshold like oauth.
   document.getElementById('f_threshold_wrap').style.display = type === 'api' ? 'none' : '';
+  document.getElementById('f_weekly_threshold_wrap').style.display = type === 'api' ? 'none' : '';
   document.getElementById('f_token_threshold_wrap').style.display = type === 'api' ? '' : 'none';
   // An API key reports no Fable limit, so "leave when it is spent" has
   // nothing to act on there.
@@ -3585,6 +3601,7 @@ function openModal() {
   document.getElementById('f_budget').value = '';
   document.getElementById('f_token_threshold').value = '';
   document.getElementById('f_threshold_val').textContent = '98';
+  document.getElementById('f_weekly_threshold_val').textContent = '98';
   document.getElementById('f_codex_model').dataset.value = '';
   document.getElementById('f_codex_model')._cuRenderValue();
   updateCodexModelHelp('f');
@@ -3627,6 +3644,7 @@ async function submitProfile() {
     kind,
     credential: kind === 'codex' ? document.getElementById('f_codex_credential').value : document.getElementById('f_credential').value,
     switch_threshold: Number(document.getElementById('f_threshold_val').textContent),
+    weekly_switch_threshold: Number(document.getElementById('f_weekly_threshold_val').textContent),
     priority: Number(document.getElementById('f_priority_val').textContent),
     automatic: !document.getElementById('f_automatic_toggle').classList.contains('off'),
     forced_for_subagents: !document.getElementById('f_forced_subagents_toggle').classList.contains('off'),
@@ -4266,8 +4284,9 @@ document.querySelectorAll('[data-pd-step]').forEach((btn) => {
     const field = btn.dataset.pdStep;
     const valEl = document.getElementById(`pd_${field}_val`);
     const delta = Number(btn.dataset.delta);
-    const max = field === 'threshold' ? 100 : 99;
-    const next = Math.max(1, Math.min(max, Number(valEl.textContent) + delta));
+    const min = field === 'priority' ? 1 : 0;
+    const max = field === 'priority' ? 99 : 100;
+    const next = Math.max(min, Math.min(max, Number(valEl.textContent) + delta));
     valEl.textContent = String(next);
   });
 });
@@ -4527,13 +4546,12 @@ setupSelectInput(document.getElementById('pd_codex_model'), CODEX_MODEL_OPTIONS(
 setupSelectInput(document.getElementById('pd_codex_reasoning'), CODEX_REASONING_OPTIONS(), () => {});
 updateCodexModelHelp('f');
 updateCodexModelHelp('pd');
-document.querySelectorAll('.stepper-btn').forEach((btn) => {
+document.querySelectorAll('.stepper-btn[data-step]').forEach((btn) => {
   btn.addEventListener('click', () => {
     const targetId = btn.dataset.step;
     const valEl = document.getElementById(`${targetId}_val`);
     const delta = Number(btn.dataset.delta);
-    // min is 1 for every stepper this handler covers (priority, threshold).
-    const min = 1;
+    const min = targetId === 'f_priority' ? 1 : 0;
     const max = targetId === 'f_priority' ? 99 : 100;
     const next = Math.max(min, Math.min(max, Number(valEl.textContent) + delta));
     valEl.textContent = String(next);

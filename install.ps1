@@ -7,10 +7,10 @@
 # dashboard.
 #
 # Run it from PowerShell:
-#     irm https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.ps1 | iex
+#     irm https://raw.githubusercontent.com/nklisch/claude-unlimited/main/install.ps1 | iex
 #
 # ...or from the classic Command Prompt / the Win+R "Run" box:
-#     powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.ps1 | iex"
+#     powershell -ExecutionPolicy Bypass -NoProfile -Command "irm https://raw.githubusercontent.com/nklisch/claude-unlimited/main/install.ps1 | iex"
 #
 # Nothing here needs administrator rights. (If you DO run it from an elevated
 # terminal, it will also set the daemon to auto-start at logon.)
@@ -40,7 +40,7 @@ function Install-ClaudeUnlimited {
         } catch {}
     }
 
-    $Repo   = 'https://github.com/DevDock-AI/claude-unlimited'
+    $Repo   = 'https://github.com/nklisch/claude-unlimited'
     $Branch = if ($env:CLAUDE_UNLIMITED_BRANCH) { $env:CLAUDE_UNLIMITED_BRANCH } else { 'main' }
     $Port   = if ($env:CLAUDE_UNLIMITED_PORT)   { $env:CLAUDE_UNLIMITED_PORT }   else { '4317' }
     $PyVer  = '3.12.7'   # only used when Python has to be installed; bump freely

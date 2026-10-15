@@ -102,6 +102,9 @@ class Profile:
     # it on for every Profile at once. Meaningless for an api-kind Profile
     # (an API key reports no Fable limit) but kept so it round-trips.
     leave_on_fable_limit: bool = False
+    # Separate from the primary (usually five-hour) threshold. Older config
+    # files inherit their existing primary value in load_pool().
+    weekly_switch_threshold: float = DEFAULT_SWITCH_THRESHOLD
 
 
 UPDATE_MODES = ("auto_install", "auto_download", "manual")
@@ -137,8 +140,8 @@ class Settings:
     # pin (which outranks both).
     distribute_sessions_default: bool = False
     # Read each subscription account's usage from the providers' read-only
-    # usage endpoints every 5-10 minutes while the user is active (see
-    # usage_probe.py for the idle pause and backoff). On by default: it sends
+    # usage endpoints about every 5 minutes, including while idle (see
+    # usage_probe.py for provider backoff). On by default: it sends
     # no messages, and the Dashboard is wrong without it.
     keep_usage_fresh: bool = True
     # The editable model-parity list: an ORDERED list of rows
@@ -257,6 +260,7 @@ def load_pool() -> Pool:
             auth_mode=p.get("auth_mode", "api_key"),
             priority=int(p.get("priority", 1)),
             switch_threshold=float(p.get("switch_threshold", DEFAULT_SWITCH_THRESHOLD)),
+            weekly_switch_threshold=float(p.get("weekly_switch_threshold", p.get("switch_threshold", DEFAULT_SWITCH_THRESHOLD))),
             enabled=bool(p.get("enabled", True)),
             automatic=bool(p.get("automatic", False)),
             default_model=p.get("default_model"),

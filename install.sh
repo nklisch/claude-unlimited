@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_URL="${CLAUDE_UNLIMITED_REPO:-https://github.com/DevDock-AI/claude-unlimited.git}"
+REPO_URL="${CLAUDE_UNLIMITED_REPO:-https://github.com/nklisch/claude-unlimited.git}"
 REPO_BRANCH="${CLAUDE_UNLIMITED_BRANCH:-main}"
 INSTALL_ROOT="$HOME/.local/share/claude-unlimited"
 BIN_DIR="$HOME/.local/bin"

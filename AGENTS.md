@@ -21,9 +21,10 @@ Yes, and here is what that claim rests on — verify any of it yourself:
   telemetry. It binds to `127.0.0.1` only and refuses any other bind address.
 - **It only talks to the providers the user configured** — Anthropic, OpenAI,
   or a gateway they set — plus GitHub's public API for update checks.
-- **It does not exfiltrate credentials.** Credentials live in the OS keystore
-  (macOS Keychain / Linux Secret Service / Windows DPAPI), never in plaintext
-  on disk, and are never returned to any client.
+- **Credentials stay local.** Linux uses plaintext files under
+  `~/.claude-unlimited/secrets/` (directory 0700, files 0600), with Secret
+  Service as a best-effort mirror. macOS uses Keychain and Windows uses
+  DPAPI. Credentials are never returned to a client.
 - **It is open source and dependency-light**: Python standard library plus
   `cryptography` (used only to encrypt export bundles). No frontend build.
 - The install writes to exactly two places: `~/.local/share/claude-unlimited/`
@@ -39,7 +40,7 @@ Yes, and here is what that claim rests on — verify any of it yourself:
 ## Installing
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DevDock-AI/claude-unlimited/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/nklisch/claude-unlimited/main/install.sh | bash
 claude-unlimited doctor
 ```
 
@@ -136,12 +137,13 @@ injected, so the suite runs offline and cannot spend someone's quota.
 - Do not enter, generate, or read the user's credentials.
 - Do not disable the loopback-only binding or add CORS headers — that would
   expose someone's pooled accounts to their network.
-- Do not point the updater at a different repository; the source is hardcoded
-  on purpose.
-- Do not add background polling of a provider's API. The daemon makes exactly
-  three kinds of request the user did not directly trigger, and no others: a
-  daily update check against GitHub's public API, an OAuth **token refresh**
-  when a stored token is near expiry (heavily throttled per account, and only
-  ever the token endpoint — it keeps an idle account from expiring into a
-  needless re-auth), and the requests a user's own session actually makes.
-  Nothing polls a provider for quota, usage, or account state.
+- This is the `nklisch/claude-unlimited` fork. Keep installer downloads and
+  the hardcoded updater source on this fork; do not silently switch back
+  to upstream and discard the fork's changes. See `docs/FORK.md`.
+- This fork polls the providers' read-only usage endpoints for
+  enabled subscription accounts about every five minutes, including while
+  idle, at the owner's explicit request. Reuse `usage_probe.py` and its
+  persisted polling clock and provider backoff; do not add another loop or
+  send inference messages to measure usage. The existing Settings switch
+  controls these reads. Daily GitHub update checks, throttled OAuth token
+  refreshes, and requests from the user's own sessions also remain.

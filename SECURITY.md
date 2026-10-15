@@ -7,7 +7,7 @@ Claude Unlimited is a local daemon holding real Anthropic credentials on your ow
 Claude Unlimited defends against:
 
 - **A malicious website in your browser.** The daemon binds to `127.0.0.1` only and validates the `Host` header on every request (blocking DNS-rebinding), so a page open in another tab can't reach the Dashboard's API. State-changing requests additionally require a per-run CSRF token that only same-origin JavaScript can obtain.
-- **Another process on your machine reading credentials off disk.** Credentials never touch disk in plain text — they're stored in the OS's native secret store (macOS Keychain, Linux Secret Service, Windows DPAPI) and never appear in `config.json`, logs, or any API response.
+- **Unrelated OS users reading Linux credential files.** Linux credential files have mode 0600 inside a mode 0700 directory. They contain plaintext credentials, so these permissions do not protect against a process running as your user, root, or someone reading an unencrypted backup. macOS uses Keychain and Windows uses DPAPI. Credentials never appear in `config.json`, logs, or any API response.
 - **XSS via a crafted Profile name, project name, or model string.** Every piece of user- or upstream-controlled text is HTML-escaped before being rendered in the Dashboard.
 
 Claude Unlimited does **not** defend against:
@@ -17,7 +17,7 @@ Claude Unlimited does **not** defend against:
 
 ## What never leaves your machine
 
-Nothing — usage stats, project attribution, the activity log, your Profile configuration — is transmitted anywhere except to the provider you configured — Anthropic, OpenAI/Codex, or your own gateway — as part of the API requests you're already making. There is no telemetry, no analytics, and no phone-home beyond polling GitHub's public Releases API to compare version numbers. The daemon does make one other request you didn't directly trigger: refreshing an OAuth account's access token shortly before it expires, which sends that account's own refresh token to the provider it already belongs to and nothing else.
+There is no telemetry or analytics. Inference requests go to the provider you configured. Background requests read enabled subscriptions' usage endpoints about every five minutes, refresh each account's OAuth token when needed, and check this fork's GitHub Releases API daily. Usage polling can be disabled in Settings and respects provider backoff. No inference messages are sent to measure usage or keep accounts warm.
 
 ## Hardening in place
 
@@ -38,4 +38,4 @@ Please include:
 
 ## Platform-specific notes
 
-The macOS backend (Keychain, `launchd`) is verified against real hardware. The Linux (`secret-tool`, `systemd --user`) and Windows (DPAPI, Task Scheduler) backends are real, unit-tested code that has not yet been run against real Linux/Windows hardware — see [`docs/adr/0005-windows-linux-backends-unverified-first-cut.md`](docs/adr/0005-windows-linux-backends-unverified-first-cut.md). If you find a security-relevant issue specific to those platforms, it's especially valuable to report.
+The fork's Linux disk credential backend and `systemd --user` service are in local use. Upstream reports real hardware verification for macOS Keychain and `launchd`; Windows DPAPI and Task Scheduler remain unverified here. See [fork installation and maintenance](docs/FORK.md) for the fork's storage policy and validation limits.

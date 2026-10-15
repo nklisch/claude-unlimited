@@ -295,6 +295,7 @@ def _profile_to_public_dict(p, runtime=None, usage=None, in_use_now=False) -> di
         "auth_mode": p.auth_mode,
         "priority": p.priority,
         "switch_threshold": p.switch_threshold,
+        "weekly_switch_threshold": p.weekly_switch_threshold,
         "enabled": p.enabled,
         "automatic": p.automatic,
         "default_model": p.default_model,
@@ -1646,7 +1647,7 @@ _RUNNING_PORT = DEFAULT_PORT
 
 
 _OAUTH_REFRESH_LOOP_INTERVAL_SECONDS = 60
-# Background usage checks (usage_probe.py): who is due, idle gating, backoff.
+# Background usage checks (usage_probe.py): endpoint poll clocks and backoff.
 _usage_probe = usage_probe.Scheduler()
 _usage_probe_tick_lock = threading.Lock()
 _UPDATE_CHECK_INTERVAL_SECONDS = 24 * 60 * 60
@@ -1936,8 +1937,8 @@ def _install_deferred_update_if_idle() -> None:
 
 def _note_user_activity() -> None:
     """Any sign someone is using Claude Unlimited: a proxied request or real
-    Dashboard input. Coming back from an idle pause checks usage straight
-    away rather than on the next tick."""
+    Dashboard input. First activity can wake the initial usage check without
+    waiting for the next tick; later reads also run while idle."""
     try:
         if _usage_probe.note_activity():
             threading.Thread(target=_run_usage_probe_tick, daemon=True, name="usage-probe-resume").start()
@@ -1947,14 +1948,10 @@ def _note_user_activity() -> None:
 
 def _usage_probe_candidates(pool) -> list:
     runtime = _gateway.runtime_snapshot()
-    observed = _gateway.usage_observed_at()
-    # A Profile that just took a 429 its account-level windows
-    # cannot explain gets its usage re-read now rather than up to ten minutes
-    # from now. Presenting it as "never observed" is the whole mechanism —
-    # Scheduler.due() skips only the INTERVAL gate for those, so the provider
-    # pause and the per-Profile backoff still apply exactly as before. No new
-    # polling loop (invariant 2); this rides the tick that already runs.
-    forced = _gateway.take_usage_recheck_requests()
+    # Recheck requests wake the existing loop, but never bypass the endpoint
+    # poll interval or a provider/account pause. Passive traffic has its own
+    # observation clock and cannot postpone or accelerate these reads.
+    _gateway.take_usage_recheck_requests()
     candidates = []
     for profile in pool.profiles:
         provider = usage_probe.provider_for(profile)
@@ -1965,8 +1962,7 @@ def _usage_probe_candidates(pool) -> list:
         # would only fail, and failing reads are exactly the noise to avoid.
         if rt is not None and rt.state.value in ("auth_invalid", "disabled"):
             continue
-        observed_at = None if profile.id in forced else observed.get(profile.id)
-        candidates.append(usage_probe.Candidate(profile.id, provider, observed_at))
+        candidates.append(usage_probe.Candidate(profile.id, provider))
     return candidates
 
 
@@ -2003,7 +1999,7 @@ def _run_usage_probe_tick() -> None:
             return
         for profile_id in _usage_probe.due(_usage_probe_candidates(pool)):
             profile = pool.get(profile_id)
-            if profile is not None:
+            if profile is not None and not _usage_probe.provider_paused(usage_probe.provider_for(profile)):
                 _probe_usage(profile)
     except Exception:  # noqa: BLE001 - a background courtesy, never a crash
         pass
@@ -2013,16 +2009,8 @@ def _run_usage_probe_tick() -> None:
 
 def _usage_probe_loop() -> None:
     while True:
-        woken = _gateway.usage_recheck_wakeup.wait(usage_probe.TICK_SECONDS)
+        _gateway.usage_recheck_wakeup.wait(usage_probe.TICK_SECONDS)
         _gateway.usage_recheck_wakeup.clear()
-        if woken:
-            # Only a re-auth sets this (see Gateway._queue_recovered_usage_read)
-            # — someone just signed an account back in, which is use, so the
-            # idle gate must not swallow the read they are waiting to see.
-            try:
-                _usage_probe.note_activity()
-            except Exception:  # noqa: BLE001
-                pass
         _run_usage_probe_tick()
 
 

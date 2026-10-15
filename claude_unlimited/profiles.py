@@ -8,6 +8,7 @@ pure local state management and runs without the proxy.
 
 from __future__ import annotations
 
+import math
 import secrets
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -116,6 +117,8 @@ def _validate_field_types(**changes) -> None:
             wanted = ("a number" if isinstance(kind, tuple)
                       else {"int": "a whole number", "str": "text"}.get(kind.__name__, kind.__name__))
             raise ValidationError(f"{key} must be {wanted}, got {type(value).__name__}.")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValidationError(f"{key} must be a finite number.")
         if minimum is not None and value < minimum:
             raise ValidationError(f"{key} must be at least {minimum}.")
         if maximum is not None and value > maximum:
@@ -123,6 +126,7 @@ def _validate_field_types(**changes) -> None:
 
     _num("priority", kind=int, minimum=1)
     _num("switch_threshold", kind=(int, float), minimum=0, maximum=100)
+    _num("weekly_switch_threshold", kind=(int, float), minimum=0, maximum=100)
     _num("token_threshold", kind=int, minimum=0, allow_none=True)
     _num("monthly_budget_cap", kind=(int, float), minimum=0, allow_none=True)
 
@@ -242,14 +246,18 @@ def create_profile(
     forced_for_subagents: bool = False,
     leave_on_fable_limit: bool = False,
     credential_already_encoded: bool = False,
+    weekly_switch_threshold: Optional[float] = None,
 ) -> Profile:
     _validate(name, kind, base_url, auth_mode, tag_color)
+    if weekly_switch_threshold is None:
+        weekly_switch_threshold = switch_threshold
     codex_reasoning_effort = upgrade_reasoning_effort(codex_reasoning_effort)
     # Same reachable-from-HTTP surface as update_profile: POST /api/profiles
     # hands this a decoded JSON body. `priority` is excluded because None is
     # legitimate here and means "compute the next free slot" just below.
     _validate_field_types(
         switch_threshold=switch_threshold, token_threshold=token_threshold,
+        weekly_switch_threshold=weekly_switch_threshold,
         monthly_budget_cap=monthly_budget_cap, automatic=automatic,
         default_model=default_model, force_model=force_model, tag_color=tag_color, plan=plan,
         codex_model=codex_model, codex_reasoning_effort=codex_reasoning_effort,
@@ -282,6 +290,7 @@ def create_profile(
         auth_mode=auth_mode,
         priority=priority,
         switch_threshold=switch_threshold,
+        weekly_switch_threshold=weekly_switch_threshold,
         automatic=automatic,
         default_model=default_model,
         force_model=force_model,
@@ -416,7 +425,7 @@ def _record_released_forced_subagents(released: list[Profile], claimant: Profile
 
 def update_profile(profile_id: str, **changes) -> Profile:
     allowed = {
-        "name", "priority", "switch_threshold", "enabled", "automatic",
+        "name", "priority", "switch_threshold", "weekly_switch_threshold", "enabled", "automatic",
         "default_model", "force_model", "monthly_budget_cap", "token_threshold", "tag_color", "base_url", "auth_mode", "plan",
         "claude_config_dir", "codex_home", "codex_model", "codex_reasoning_effort",
         "forced_for_subagents", "leave_on_fable_limit",
