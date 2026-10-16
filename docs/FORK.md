@@ -70,6 +70,10 @@ claude-unlimited.service` still leaves it stopped.
 - Streaming reads forward available chunks promptly. Bounded diagnostics
   record incomplete streams and rotation/retry reasons without logging
   request bodies or credentials. Partial streamed output is not replayed.
+- Dashboard reads retry once if a response cannot be decoded as JSON.
+  Persistent failures show a readable message and log the failing endpoint,
+  status, and attempt in the browser console, without response contents.
+  Writes are never replayed by this recovery path.
 - Linux credentials use disk storage first, so keyring outages do not
   break ordinary requests. See the storage policy below.
 

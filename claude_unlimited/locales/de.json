@@ -688,5 +688,6 @@
   "modal.add_profile.primary_threshold_label": "Wechselschwelle (5 Stunden)",
   "modal.add_profile.weekly_threshold_label": "Wöchentliche Wechselschwelle",
   "modal.detail.weekly_threshold_sub": "Bei diesem Prozentsatz der wöchentlichen Kontonutzung wechseln. Ein Zurücksetzen des 5-Stunden-Fensters setzt die Wochennutzung nicht zurück.",
-  "profiles.edit_primary_threshold": "5-Stunden-Schwelle bearbeiten; die Wochenschwelle steht in den Kontodetails"
+  "profiles.edit_primary_threshold": "5-Stunden-Schwelle bearbeiten; die Wochenschwelle steht in den Kontodetails",
+  "api.invalid_json_response": "Das Dashboard hat eine unvollständige oder ungültige Antwort erhalten. Bitte lade die Seite neu."
 }

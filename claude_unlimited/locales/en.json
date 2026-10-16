@@ -688,5 +688,6 @@
   "modal.add_profile.primary_threshold_label": "5-hour switch threshold",
   "modal.add_profile.weekly_threshold_label": "Weekly switch threshold",
   "modal.detail.weekly_threshold_sub": "Rotate away at this account's weekly usage %. A 5-hour reset does not reset weekly usage.",
-  "profiles.edit_primary_threshold": "Edit the 5-hour threshold; edit the weekly threshold in account details"
+  "profiles.edit_primary_threshold": "Edit the 5-hour threshold; edit the weekly threshold in account details",
+  "api.invalid_json_response": "The dashboard received an incomplete or invalid response. Please refresh."
 }

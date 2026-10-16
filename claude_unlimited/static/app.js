@@ -239,27 +239,53 @@ function refreshCodexSelectOptions() {
 }
 
 async function api(path, opts = {}) {
+  const method = (opts.method || 'GET').toUpperCase();
   const headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
-  if (opts.method && opts.method !== 'GET') headers['X-CSRF-Token'] = CSRF;
-  const res = await fetch(path, Object.assign({}, opts, { headers }));
-  const body = await res.json();
-  if (!res.ok) {
-    if (body.error === 'csrf') {
-      // The CSRF token is generated at daemon startup and embedded once into
-      // this page's HTML, so it can never match again after a daemon restart
-      // while the tab stays open. Reload instead of surfacing a raw 403.
-      if (!_csrfRecoveryStarted) {
-        _csrfRecoveryStarted = true;
-        showToast('info', t('toast.session_refreshing'), t('toast.session_refreshing_sub'));
-        setTimeout(() => window.location.reload(), 1200);
+  if (method !== 'GET') headers['X-CSRF-Token'] = CSRF;
+  // A truncated response used to leave a panel showing the JSON parser's
+  // error. Retry a read once; a write may already have landed, so never
+  // replay POST/PATCH/DELETE just because its response could not be read.
+  const attempts = method === 'GET' ? 2 : 1;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const res = await fetch(path, Object.assign({}, opts, { method, headers }));
+    let body;
+    try {
+      body = await res.json();
+    } catch (cause) {
+      if (!(cause instanceof SyntaxError || cause instanceof TypeError)) throw cause;
+      // Parser messages can quote response contents. Log metadata only,
+      // without query strings, response bodies, credentials or token values.
+      console.warn('Dashboard response could not be decoded', {
+        endpoint: path.split('?')[0], method, status: res.status,
+        attempt, attempts, error: cause.name,
+      });
+      if (attempt < attempts) {
+        await new Promise((resolve) => setTimeout(resolve, 250));
+        continue;
       }
-      throw new Error(t('toast.session_refreshing'));
+      const err = new Error(_strings['api.invalid_json_response'] ||
+        'The dashboard received an incomplete or invalid response. Please refresh.');
+      err.code = 'invalid_json_response';
+      throw err;
     }
-    const err = new Error(body.message || body.error || 'request failed');
-    err.code = body.error;
-    throw err;
+    if (!res.ok) {
+      if (body.error === 'csrf') {
+        // The CSRF token is generated at daemon startup and embedded once into
+        // this page's HTML, so it can never match again after a daemon restart
+        // while the tab stays open. Reload instead of surfacing a raw 403.
+        if (!_csrfRecoveryStarted) {
+          _csrfRecoveryStarted = true;
+          showToast('info', t('toast.session_refreshing'), t('toast.session_refreshing_sub'));
+          setTimeout(() => window.location.reload(), 1200);
+        }
+        throw new Error(t('toast.session_refreshing'));
+      }
+      const err = new Error(body.message || body.error || 'request failed');
+      err.code = body.error;
+      throw err;
+    }
+    return body;
   }
-  return body;
 }
 
 function esc(s) {

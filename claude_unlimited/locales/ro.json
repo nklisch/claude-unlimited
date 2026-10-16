@@ -688,5 +688,6 @@
   "modal.add_profile.primary_threshold_label": "Prag de comutare la 5 ore",
   "modal.add_profile.weekly_threshold_label": "Prag de comutare săptămânal",
   "modal.detail.weekly_threshold_sub": "Schimbă contul la acest procent de utilizare săptămânală. Resetarea celor 5 ore nu resetează utilizarea săptămânală.",
-  "profiles.edit_primary_threshold": "Editează pragul de 5 ore; pragul săptămânal se editează în detaliile contului"
+  "profiles.edit_primary_threshold": "Editează pragul de 5 ore; pragul săptămânal se editează în detaliile contului",
+  "api.invalid_json_response": "Panoul a primit un răspuns incomplet sau nevalid. Reîncarcă pagina."
 }

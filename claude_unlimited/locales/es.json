@@ -688,5 +688,6 @@
   "modal.add_profile.primary_threshold_label": "Umbral de cambio de 5 horas",
   "modal.add_profile.weekly_threshold_label": "Umbral de cambio semanal",
   "modal.detail.weekly_threshold_sub": "Cambiar de cuenta al alcanzar este % de uso semanal. El reinicio de las 5 horas no reinicia el uso semanal.",
-  "profiles.edit_primary_threshold": "Editar el umbral de 5 horas; el semanal se edita en los detalles de la cuenta"
+  "profiles.edit_primary_threshold": "Editar el umbral de 5 horas; el semanal se edita en los detalles de la cuenta",
+  "api.invalid_json_response": "El panel recibió una respuesta incompleta o no válida. Actualiza la página."
 }
